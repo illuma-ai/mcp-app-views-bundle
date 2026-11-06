@@ -1,0 +1,50 @@
+# Tools enabled for the local run, one regex per line (see --enabled-tools-file).
+# Mail, people, calendar, Teams chats (no channel tools: they need admin consent), files, contacts, To Do,
+# and the review and reading helpers. test/result-safety.test.ts checks this file against the registered tools.
+#   ms-365-mcp-server --http 127.0.0.1:3001 --org-mode --enabled-tools-file docs/enabled-tools.local.txt
+^list-mail-messages$
+^list-mail-folder-messages$
+^list-mail-folders$
+^get-mail-message$
+^read-mail-text$
+^create-draft-email$
+^create-reply-draft$
+^create-reply-all-draft$
+^create-forward-draft$
+^update-mail-message$
+^send-draft-message$
+^delete-mail-message$
+^move-mail-message$
+^list-relevant-people$
+^get-current-user$
+^list-calendar-events$
+^get-calendar-view$
+^get-calendar-event$
+^create-calendar-event$
+^compose-calendar-event$
+^update-calendar-event$
+^delete-calendar-event$
+^accept-calendar-event$
+^tentatively-accept-calendar-event$
+^decline-calendar-event$
+^list-chats$
+^get-chat$
+^list-chat-messages$
+^get-chat-message$
+^list-chat-message-replies$
+^send-chat-message$
+^reply-to-chat-message$
+^compose-chat-message$
+^list-folder-files$
+^get-drive-item$
+^search-onedrive-files$
+^move-rename-onedrive-item$
+^delete-onedrive-file$
+^create-onedrive-folder$
+^list-outlook-contacts$
+^list-contact-folder-contacts$
+^get-outlook-contact$
+^list-todo-task-lists$
+^list-todo-tasks$
+^update-todo-task$
+^create-todo-task$

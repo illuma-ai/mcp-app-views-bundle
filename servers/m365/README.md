@@ -1,0 +1,1351 @@
+# ms-365-mcp-server
+
+[![npm version](https://img.shields.io/npm/v/@softeria/ms-365-mcp-server.svg)](https://www.npmjs.com/package/@softeria/ms-365-mcp-server) [![build status](https://github.com/softeria/ms-365-mcp-server/actions/workflows/build.yml/badge.svg)](https://github.com/softeria/ms-365-mcp-server/actions/workflows/build.yml) [![license](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/softeria/ms-365-mcp-server/blob/main/LICENSE)
+
+Microsoft 365 MCP Server
+
+A Model Context Protocol (MCP) server for interacting with Microsoft 365 and Microsoft Office services through the Graph
+API.
+
+## Supported Clouds
+
+This server supports multiple Microsoft cloud environments:
+
+| Cloud                | Description                          | Auth Endpoint             | Graph API Endpoint              |
+| -------------------- | ------------------------------------ | ------------------------- | ------------------------------- |
+| **Global** (default) | International Microsoft 365          | login.microsoftonline.com | graph.microsoft.com             |
+| **China** (21Vianet) | Microsoft 365 operated by 21Vianet   | login.chinacloudapi.cn    | microsoftgraph.chinacloudapi.cn |
+| **GCC High**         | Microsoft 365 US Government GCC High | login.microsoftonline.us  | graph.microsoft.us              |
+
+GCC High has no pre-registered client: register an app in your government tenant and set `MS365_MCP_CLIENT_ID` (and `MS365_MCP_TENANT_ID`), then use `--cloud gcc-high`.
+
+To route Graph traffic through a proxy of your own (one that terminates the client's plain HTTP and originates TLS to Microsoft), set `MS365_MCP_GRAPH_BASE_URL` to its base URL; see the environment variable list under CLI Options, including what still bypasses it.
+
+## Prerequisites
+
+- Node.js >= 20 (recommended)
+- Node.js 14+ may work with dependency warnings
+
+## Features
+
+- Authentication via Microsoft Authentication Library (MSAL)
+- Comprehensive Microsoft 365 service integration
+- Read-only mode support for safe operations
+- Tool filtering for granular access control
+- [Tool presets](#tool-presets) and [dynamic discovery](#dynamic-tool-discovery) to shrink the tool surface and token usage
+
+## Output Format: JSON vs TOON
+
+The server supports two output formats that can be configured globally:
+
+### JSON Format (Default)
+
+Standard JSON output with pretty-printing:
+
+```json
+{
+  "value": [
+    {
+      "id": "1",
+      "displayName": "Alice Johnson",
+      "mail": "alice@example.com",
+      "jobTitle": "Software Engineer"
+    }
+  ]
+}
+```
+
+### (experimental) TOON Format
+
+[Token-Oriented Object Notation](https://github.com/toon-format/toon) for efficient LLM token usage:
+
+```
+value[1]{id,displayName,mail,jobTitle}:
+  "1",Alice Johnson,alice@example.com,Software Engineer
+```
+
+**Benefits:**
+
+- 30-60% fewer tokens vs JSON
+- Best for uniform array data (lists of emails, calendar events, files, etc.)
+- Ideal for cost-sensitive applications at scale
+
+**Usage:**
+(experimental) Enable TOON format globally:
+
+Via CLI flag:
+
+```bash
+npx @softeria/ms-365-mcp-server --toon
+```
+
+Via Claude Desktop configuration:
+
+```json
+{
+  "mcpServers": {
+    "ms365": {
+      "command": "npx",
+      "args": ["-y", "@softeria/ms-365-mcp-server", "--toon"]
+    }
+  }
+}
+```
+
+Via environment variable:
+
+```bash
+MS365_MCP_OUTPUT_FORMAT=toon npx @softeria/ms-365-mcp-server
+```
+
+## Supported Services & Tools
+
+The server provides 300+ tools covering most of the Microsoft Graph API surface. Each tool maps 1-to-1 to a Graph API endpoint and is defined declaratively in [`src/endpoints.json`](src/endpoints.json).
+
+### Personal Account Tools (Available by default)
+
+Email (Outlook), Calendar, OneDrive Files, Excel, OneNote, To Do Tasks, Planner, Contacts, User Profile, Search
+
+### Organization Account Tools (Requires --org-mode flag)
+
+Teams & Chats, Online Meetings, Transcripts & Recordings, Attendance Reports, SharePoint Sites & Lists, Shared Mailboxes & Calendars, User Management, Presence, Virtual Events
+
+Custom Teams emojis are available in organization mode through `list-custom-emojis`
+and `create-custom-emoji` (`teams` and `work` presets). These use the Microsoft Graph
+beta API and request the delegated permissions `TeamworkCustomEmoji.Read` and
+`TeamworkCustomEmoji.Create`, respectively. Read-only mode exposes only the list tool.
+Existing deployments may need consent for these new scopes and reauthentication;
+adding tool support does not upgrade an already-issued token.
+
+Listing can return `contentBytes: null` by default. To request base64 PNG/GIF images,
+pass `select: "displayName,contentBytes"` or `select: ["displayName", "contentBytes"]`.
+Use a small `top` to keep image responses manageable.
+To create an emoji, pass `body: { displayName, contentBytes }`
+with the exact approved name and base64 PNG/GIF file bytes. See Microsoft's
+[list](https://learn.microsoft.com/en-us/graph/api/teamworkmessaging-list-customemojis?view=graph-rest-beta)
+and [create](https://learn.microsoft.com/en-us/graph/api/teamworkmessaging-post-customemojis?view=graph-rest-beta)
+contracts. These tools do not post messages or reactions.
+
+### Required Graph API Permissions
+
+Permissions are requested dynamically based on which tools are enabled. Use `--list-permissions` to see the exact permissions for your configuration:
+
+```bash
+# Personal mode (default)
+npx @softeria/ms-365-mcp-server --list-permissions
+
+# Organization mode (includes Teams, SharePoint, etc.)
+npx @softeria/ms-365-mcp-server --org-mode --list-permissions
+
+# Filtered by preset
+npx @softeria/ms-365-mcp-server --preset mail --list-permissions
+```
+
+This is useful for enterprise environments where Graph API permissions must be pre-approved and admin-consented before deploying a new version.
+
+The `--list-permissions` JSON includes:
+
+- `toolPermissions`: permissions implied by the tool surface before `--allowed-scopes` filtering
+- `effectivePermissions`: permissions implied by the tools that remain enabled after `--allowed-scopes`
+- `permissions`: legacy alias for `effectivePermissions`, kept for compatibility with existing scripts
+- `allowedScopes`: the configured scope allowlist, when provided
+- `disabledTools`: tools hidden because their required Graph scopes are not covered by `allowedScopes`
+- `missingAllowedScopesForTools`: unique missing scopes across disabled tools
+- `extraAllowedScopesNotUsedByTools`: allowed scopes that are not used by the current tool surface
+
+### Allowed Scopes
+
+By default, MSAL requests the scopes implied by the enabled tools, and the tool surface is controlled by `--enabled-tools`, `--enabled-tools-file`, `--preset`, `--org-mode`, and `--read-only`.
+
+Enterprise and headless deployments can add a scope boundary with `--allowed-scopes` or `MS365_MCP_ALLOWED_SCOPES`. When configured, the server first computes the normal tool surface, then hides Graph tools whose required scopes are not covered by the allowlist. OAuth metadata and login flows request only the effective permissions for the tools that remain enabled.
+
+```bash
+npx @softeria/ms-365-mcp-server \
+  --org-mode \
+  --enabled-tools '^(list-mail-messages|get-mail-message|list-drives|get-drive-item|download-bytes)$' \
+  --allowed-scopes 'User.Read Mail.Read Files.Read'
+```
+
+For longer filters, put one regex per line in a file and pass `--enabled-tools-file` / `ENABLED_TOOLS_FILE`. Blank lines and whole-line `#` comments are dropped; the rest are joined with `|`, so the file is equivalent to `--enabled-tools=line1|line2|…`:
+
+```text
+# tools.txt
+^list-mail-messages$
+^get-mail-message$
+drive|download-bytes
+```
+
+```bash
+npx @softeria/ms-365-mcp-server --org-mode --enabled-tools-file ./tools.txt
+```
+
+CLI value takes precedence over `MS365_MCP_ALLOWED_SCOPES`; if neither is set, the default tool-derived scope behavior is unchanged. Supplying an empty value fails at startup so deployments do not accidentally fall back to a wider tool surface.
+
+Scope coverage is hierarchy-aware: for example, `Mail.ReadWrite` covers tools that require `Mail.Read`, and `Files.ReadWrite.All` covers tools that require `Files.Read`.
+
+SharePoint supports two enterprise permission models:
+
+- Broad tenant scopes such as `Sites.Read.All`, `Sites.ReadWrite.All`, and `Sites.Manage.All`.
+- Microsoft Graph `Sites.Selected`, where SharePoint site access is granted to the app on specific site collections and Graph evaluates the signed-in user's own permissions at request time.
+
+The default org-mode behavior continues to request the broad SharePoint scopes used by existing deployments. Enterprises that want selected-site SharePoint access can set an allowlist containing `Sites.Selected` instead of broad `Sites.*.All` scopes. Direct site/list/item tools that target an explicit SharePoint site, and the `/drives/{drive-id}/...` item tools (list, get, upload, folder, move/rename, copy, versions) for drives of a granted site, can run with `Sites.Selected`; tenant-wide SharePoint discovery and search tools still require broad SharePoint scopes.
+
+```bash
+npx @softeria/ms-365-mcp-server \
+  --org-mode \
+  --read-only \
+  --enabled-tools 'sharepoint|site|drive|planner' \
+  --allowed-scopes 'User.Read Files.Read Notes.Read Tasks.Read Sites.Selected'
+```
+
+In HTTP mode, OAuth discovery advertises the effective filtered permissions so clients request the same consent surface. On-Behalf-Of mode (`--obo`) still advertises `<clientId>/access_as_user` for protected-resource metadata and requests it on `/authorize`; `--allowed-scopes` does not override OBO, it only narrows the tool surface.
+
+### Restricting user profile fields
+
+Deployments can set a comma-separated field filter for selected user-directory paths with
+`--user-fields` or `MS365_MCP_USER_FIELDS`. It narrows the `$select` sent to Microsoft Graph
+on `/users` reads and projects responses on the covered paths listed below. This is a
+path-specific data filter, **not a complete Graph authorization boundary**: other Graph
+routes and resource shapes can expose overlapping profile data.
+
+```bash
+npx @softeria/ms-365-mcp-server \
+  --org-mode \
+  --user-fields 'id,displayName,mail,userPrincipalName'
+```
+
+The filter is keyed on known Graph paths rather than tool names. It applies to direct tools,
+discovery mode's `execute-tool`, and matching `graph-batch` subrequests. Batch subrequest URLs
+are rewritten on covered `/users` reads, and responses are projected on all covered profile
+paths. The byte-passthrough tools (`download-bytes`, `download-bytes-to-file`,
+`get-download-url`) return responses verbatim and refuse targets matching the covered user
+profile paths while the filter is active.
+
+Two levels of enforcement apply, depending on what Graph returns:
+
+| Path                                                                                                                                  | Enforcement                                                                                                                                                                                                                              |
+| ------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/users`, `/users/{id}`                                                                                                               | `$select` is narrowed on the request and the response is projected, so excluded fields never leave the tenant                                                                                                                            |
+| `/me/manager`, `/me/directReports`, `/users/{id}/manager`, `/users/{id}/directReports`, `/groups/{id}/members`, `/groups/{id}/owners` | The response is projected. These are typed as `directoryObject`, where Graph requires an OData cast before it will `$select` a user-only property such as `jobTitle`, so narrowing the request would risk breaking calls that work today |
+
+While the filter is active, `$expand` is removed from `/me`, `/groups`, and `/groups/{id}`
+requests because those resources can expand to related user profiles. This also applies to
+matching batch subrequests. The base `/me` and group responses are otherwise not projected.
+
+This does **not** cover every route that can return a user-shaped object. In particular,
+generic Graph access can still reach alternate routes or representations such as
+`/directoryObjects/{id}`, `/groups/{id}/transitiveMembers`, or `/users('{id}')`. Those are
+not currently normalized to the covered paths. If this setting is a security requirement,
+also restrict generic Graph access (for example `graph-batch`) and validate the effective
+tool surface for your deployment; do not rely on `--user-fields` alone as a tenant-wide
+data-access control.
+
+Resources below a user, such as `/users/{id}/messages` or `/users/{id}/photo/$value`, are
+mail, calendar and binary resources rather than profile properties, and are unaffected. The
+signed-in user's own `/me` profile is also unaffected, as are the Teams and chat member
+lists, which return `conversationMember` rather than user profiles.
+
+#### Known gap: `list-relevant-people`
+
+`list-relevant-people` (`/me/people`) is **not** covered. It returns `person` resources,
+a different type whose properties only partly overlap with `user` — it carries `jobTitle`,
+`department` and `officeLocation`, but addresses arrive as `scoredEmailAddresses` rather
+than `mail`. Applying a user-field allowlist to it would reject valid field names and
+narrow the result to something the tool could not use.
+
+Deployments that need the people surface closed as well should drop the tool from the
+surface, for example with `--enabled-tools` or by choosing a preset that excludes it:
+
+```bash
+npx @softeria/ms-365-mcp-server \
+  --org-mode \
+  --user-fields 'id,displayName,mail' \
+  --enabled-tools '^(?!list-relevant-people$).*'
+```
+
+CLI values take precedence over the environment variable. A value that names no fields fails
+at startup. When neither is configured, existing behavior is unchanged. Configure this in
+the chat host's MCP server environment or command arguments; project-local `.env` files are
+intentionally restricted to application credentials and are not used for this setting.
+
+The allowlist is exhaustive for user properties: unlike an ordinary `$select`, `id` is only
+returned when it appears in the list, so include it if downstream tools need it to address a
+user. Collection annotations such as `@odata.nextLink` are retained so paging keeps working.
+If Graph returns none of the allowlisted properties, the response is projected to empty
+rather than returned untrimmed.
+
+### Requesting extra scopes
+
+`--allowed-scopes` only ever _narrows_ the token request. To request a Graph scope that no bundled tool needs — for example to drive an endpoint via `graph-batch` — use `--extra-scopes` (or `MS365_MCP_EXTRA_SCOPES`). These scopes are appended verbatim to the token request, on top of the tool-derived scopes.
+
+```bash
+npx @softeria/ms-365-mcp-server \
+  --org-mode \
+  --extra-scopes 'CopilotPackages.ReadWrite.All'
+```
+
+This is for use with your own Azure app registration (`MS365_MCP_CLIENT_ID` / `MS365_MCP_CLIENT_SECRET`): the default Softeria app only declares a lean, fixed permission set, so request additional scopes against an app you control (your tenant admin consents to them there). CLI value takes precedence over the env var; an empty value fails at startup.
+
+## Organization/Work Mode
+
+To access work/school features (Teams, SharePoint, etc.), enable organization mode using any of these flags:
+
+```json
+{
+  "mcpServers": {
+    "ms365": {
+      "command": "npx",
+      "args": ["-y", "@softeria/ms-365-mcp-server", "--org-mode"]
+    }
+  }
+}
+```
+
+Organization mode must be enabled from the start to access work account features. Without this flag, only personal
+account features (email, calendar, OneDrive, etc.) are available.
+
+## Shared Mailbox Access
+
+To access shared mailboxes, you need:
+
+1. **Organization mode**: Shared mailbox tools require `--org-mode` flag (work/school accounts only)
+2. **Delegated permissions**: `Mail.Read.Shared` to read, `Mail.ReadWrite.Shared` to create, update or move
+   messages, `Mail.Send.Shared` to send, reply or forward, and `Calendars.Read.Shared` for the shared calendar
+   tools
+3. **Exchange permissions**: The signed-in user must have been granted access to the shared mailbox
+4. **Usage**: Use the shared mailbox's email address as the `user-id` parameter in the shared mailbox tools
+
+**Finding shared mailboxes**: Use the `list-users` tool to discover available users and shared mailboxes in your
+organization.
+
+Example: `list-shared-mailbox-messages` with `user-id` set to `shared-mailbox@company.com`
+
+## Quick Start Example
+
+Test login in Claude Desktop:
+
+![Login example](https://github.com/user-attachments/assets/27f57f0e-57b8-4366-a8d1-c0bdab79900c)
+
+## Examples
+
+![Image](https://github.com/user-attachments/assets/ed275100-72e8-4924-bcf2-cd8e1b4c6f3a)
+
+## Integration
+
+### Claude Desktop
+
+To add this MCP server to Claude Desktop, edit the config file under Settings > Developer.
+
+#### Personal Account (MSA)
+
+```json
+{
+  "mcpServers": {
+    "ms365": {
+      "command": "npx",
+      "args": ["-y", "@softeria/ms-365-mcp-server"]
+    }
+  }
+}
+```
+
+#### Work/School Account (Global)
+
+```json
+{
+  "mcpServers": {
+    "ms365": {
+      "command": "npx",
+      "args": ["-y", "@softeria/ms-365-mcp-server", "--org-mode"]
+    }
+  }
+}
+```
+
+#### Work/School Account (China 21Vianet)
+
+```json
+{
+  "mcpServers": {
+    "ms365-china": {
+      "command": "npx",
+      "args": ["-y", "@softeria/ms-365-mcp-server", "--org-mode", "--cloud", "china"]
+    }
+  }
+}
+```
+
+### Claude Code CLI
+
+#### Personal Account (MSA)
+
+```bash
+claude mcp add ms365 -- npx -y @softeria/ms-365-mcp-server
+```
+
+#### Work/School Account (Global)
+
+```bash
+# macOS/Linux
+claude mcp add ms365 -- npx -y @softeria/ms-365-mcp-server --org-mode
+
+# Windows (use cmd /c wrapper)
+claude mcp add ms365 -s user -- cmd /c "npx -y @softeria/ms-365-mcp-server --org-mode"
+```
+
+#### Work/School Account (China 21Vianet)
+
+```bash
+# macOS/Linux
+claude mcp add ms365-china -- npx -y @softeria/ms-365-mcp-server --org-mode --cloud china
+
+# Windows (use cmd /c wrapper)
+claude mcp add ms365-china -s user -- cmd /c "npx -y @softeria/ms-365-mcp-server --org-mode --cloud china"
+```
+
+For other interfaces that support MCPs, please refer to their respective documentation for the correct
+integration method.
+
+### Open WebUI
+
+Open WebUI supports MCP servers via HTTP transport with OAuth 2.1.
+
+1. Start the server with HTTP mode:
+
+   ```bash
+   npx @softeria/ms-365-mcp-server --http
+   ```
+
+2. In Open WebUI, go to **Admin Settings → Tools** (`/admin/settings/tools`) → **Add Connection**:
+   - **Type**: MCP Streamable HTTP
+   - **URL**: Your MCP server URL with `/mcp` path
+   - **Auth**: OAuth 2.1
+
+3. Click **Register Client**.
+
+> **Note**: Dynamic client registration is enabled by default in HTTP mode. Use `--no-dynamic-registration` (or set `MS365_MCP_DISABLE_DCR=true`) to disable it. If using a custom Azure Entra app, the platform type for your redirect URI depends on whether the app has a client secret: with a secret use "Web", without one use "Mobile and desktop applications" (never "Single-page application").
+
+**Quick test setup** using the default Azure app (ID `ms-365` and `localhost:8080` are pre-configured):
+
+```bash
+docker run -d -p 8080:8080 \
+  -e WEBUI_AUTH=false \
+  -e OPENAI_API_KEY \
+  ghcr.io/open-webui/open-webui:main
+
+npx @softeria/ms-365-mcp-server --http
+```
+
+Then add connection with URL `http://localhost:3000/mcp` and ID `ms-365`.
+
+![Open WebUI MCP Connection](https://github.com/user-attachments/assets/dcab71dd-cf02-4bcb-b7db-5725d6be4064)
+
+> **Running in Docker behind a reverse proxy?** Set `--public-url https://your-domain.com` so the OAuth authorize URL handed to the user's browser is reachable from outside the container network. See [docs/deployment.md](docs/deployment.md) for the full guide.
+
+### Local Development
+
+For local development or testing:
+
+```bash
+# From the project directory
+claude mcp add ms -- npx tsx src/index.ts --org-mode
+```
+
+Or configure Claude Desktop manually:
+
+```json
+{
+  "mcpServers": {
+    "ms365": {
+      "command": "node",
+      "args": ["/absolute/path/to/ms-365-mcp-server/dist/index.js", "--org-mode"]
+    }
+  }
+}
+```
+
+> **Note**: Run `npm run build` after code changes to update the `dist/` folder.
+
+### Authentication
+
+> ⚠️ You must authenticate before using tools.
+
+The server supports three authentication methods:
+
+#### 1. Device Code Flow (Default)
+
+For interactive authentication via device code:
+
+- **MCP client login**:
+  - Call the `login` tool (auto-checks existing token)
+  - If needed, get URL+code, visit in browser
+  - Use `verify-login` tool to confirm
+- **CLI login**:
+  ```bash
+  npx @softeria/ms-365-mcp-server --login
+  ```
+  Follow the URL and code prompt in the terminal.
+
+Tokens are cached securely in your OS credential store (fallback to file).
+
+#### 2. OAuth Authorization Code Flow (HTTP mode only)
+
+When running with `--http`, the server **requires** OAuth authentication:
+
+```bash
+npx @softeria/ms-365-mcp-server --http 3000
+```
+
+This mode:
+
+- Advertises OAuth capabilities to MCP clients
+- Provides OAuth endpoints at `/auth/*` (authorize, token, metadata)
+- **Requires** `Authorization: Bearer <token>` for all MCP requests
+- Validates tokens with Microsoft Graph API
+- **Disables** login/logout tools by default (use `--enable-auth-tools` to enable them)
+
+MCP clients will automatically handle the OAuth flow when they see the advertised capabilities.
+
+##### Setting up Azure AD for OAuth Testing
+
+To use OAuth mode with custom Azure credentials (recommended for production), you'll need to set up an Azure AD app
+registration:
+
+1. **Create Azure AD App Registration**:
+
+- Go to [Azure Portal](https://portal.azure.com)
+- Navigate to Azure Active Directory → App registrations → New registration
+- Set name: "MS365 MCP Server"
+
+2. **Configure Redirect URIs**:
+
+- **Configure the OAuth callback URI**: Go to your app registration and on the left side, go to Authentication.
+- Under Platform configurations:
+  - Click Add a platform (if you don’t already see one for "Mobile and desktop applications" / "Public client").
+  - Choose Mobile and desktop applications or Public client/native (mobile & desktop) (label depends on portal version).
+
+3. **Testing with MCP Inspector (`npm run inspector`)**:
+
+- Go to your app registration and on the left side, go to Authentication.
+- Under Platform configurations:
+  - Click Add a platform (if you don’t already see one for "Web").
+  - Choose Web.
+  - Configure the following redirect URIs
+    - `http://localhost:6274/oauth/callback`
+    - `http://localhost:6274/oauth/callback/debug`
+    - `http://localhost:3000/callback` (optional, for server callback)
+
+4. **Get Credentials**:
+
+- Copy the **Application (client) ID** from Overview page
+- Go to Certificates & secrets → New client secret → Copy the secret value (optional for public apps)
+
+5. **Configure Environment Variables**:
+   Create a `.env` file in your project root:
+   ```env
+   MS365_MCP_CLIENT_ID=your-azure-ad-app-client-id-here
+   MS365_MCP_CLIENT_SECRET=your-secret-here  # Optional for public apps
+   MS365_MCP_TENANT_ID=common
+   ```
+
+With these configured, the server will use your custom Azure app instead of the built-in one.
+
+> **Note**: `.env` is read from the directory the server is started in, and the MCP client decides what
+> that is. Only `MS365_MCP_CLIENT_ID`, `MS365_MCP_CLIENT_SECRET`, `MS365_MCP_TENANT_ID` and
+> `MS365_MCP_CLOUD_TYPE` are read from it. Every other variable listed above must be set in your shell
+> or MCP client config; anything else found in a `.env` is ignored with a warning on stderr.
+
+#### 3. Bring Your Own Token (BYOT)
+
+If you are running ms-365-mcp-server as part of a larger system that manages Microsoft OAuth tokens externally, you can
+provide an access token directly to this MCP server:
+
+```bash
+MS365_MCP_OAUTH_TOKEN=your_oauth_token npx @softeria/ms-365-mcp-server
+```
+
+This method:
+
+- Bypasses the interactive authentication flows
+- Use your pre-existing OAuth token for Microsoft Graph API requests
+- Does not handle token refresh (token lifecycle management is your responsibility)
+
+#### 4. App Mode (application permissions, no signed-in user)
+
+> **Warning**: application permissions apply to the whole tenant. `Mail.Read` granted to the app reads every
+> mailbox, `Files.ReadWrite.All` writes every OneDrive and site, and whoever can call this server acts with
+> them. Grant the fewest permissions you can. To limit which mailboxes and calendars it reaches, grant the
+> mail and calendar permissions with
+> [RBAC for Applications in Exchange Online](https://learn.microsoft.com/en-us/exchange/permissions-exo/application-rbac)
+> **instead of** in Microsoft Entra: the two add up, so an Entra `Mail.Read` grant left in place still reaches
+> every mailbox. SharePoint sites can be narrowed with `Sites.Selected`.
+
+For unattended agents that act as the app registration itself (client credentials):
+
+```bash
+MS365_MCP_CLIENT_ID=<your app id> \
+MS365_MCP_TENANT_ID=<your tenant id or domain> \
+MS365_MCP_CLIENT_SECRET=<secret> \
+npx @softeria/ms-365-mcp-server --app-mode --read-only
+```
+
+- Use your own app registration with **application** permissions and admin consent, and set exactly one
+  credential:
+  - `MS365_MCP_CLIENT_SECRET`
+  - `MS365_MCP_CLIENT_CERTIFICATE_PATH`: a PEM file with the certificate and its unencrypted private key
+  - `MS365_MCP_FEDERATED_TOKEN_FILE`: a token from an identity provider the app trusts through
+    [workload identity federation](https://learn.microsoft.com/en-us/entra/workload-id/workload-identity-federation),
+    read again on every token request. On AKS set it to `$AZURE_FEDERATED_TOKEN_FILE`, which Kubernetes
+    keeps fresh. A GitHub Actions OIDC token is valid for 5 minutes, so writing it to a file once only
+    covers the first Graph token (about an hour) unless something rewrites the file. If Entra answers
+    `AADSTS700213`, set the federated credential's subject to the one quoted in the error (GitHub's
+    subject can include the owner and repo ids).
+
+  `MS365_MCP_TENANT_ID` must be a real tenant, not `common`.
+
+- On an Azure host (App Service, Container Apps, VM, ...) set `MS365_MCP_MANAGED_IDENTITY=system`, or the
+  client id of a user-assigned identity, instead. No app registration, tenant id or secret is needed, and
+  Key Vault (`MS365_MCP_KEYVAULT_URL`) is not read. Graph
+  application permissions for a managed identity can't be granted in the portal;
+  [assign them with PowerShell or the Graph API](https://learn.microsoft.com/en-us/entra/identity/managed-identities-azure-resources/how-to-assign-app-role-managed-identity).
+  On Azure Container Instances, give the container one kind of identity: with both a system- and a
+  user-assigned identity, the system-assigned token request fails there.
+- Tokens are renewed automatically. Nothing is cached on disk.
+- Only tools that work with application permissions are offered: the `/users/{user-id}` mail and calendar
+  tools (pass a UPN or object id as `user-id`), users and groups, OneDrive/SharePoint drives and lists, Planner,
+  Teams reads, presence, places and subscriptions. `/me` tools, Excel, OneNote and sending Teams chat or channel
+  messages are not available, because Graph does not support them with application permissions.
+- `--list-permissions --app-mode` lists the application permissions the offered tools use. `--allowed-scopes`,
+  `--enabled-tools`, `--preset` and `--read-only` narrow the surface as usual.
+- `--verify-login --app-mode` gets a token and shows the app id, tenant and granted roles (Exchange RBAC
+  grants do not show up there).
+- The `mail`, `calendar` and `outlook` presets are built from `/me` tools and leave little in app mode; the
+  `/users/{user-id}` mail and calendar tools are in `work`.
+- stdio only. It refuses `--http`, `--obo`, `--extra-scopes`, `MS365_MCP_OAUTH_TOKEN` and the
+  login/account options.
+- Webinar tools also need an application access policy assigned to the organizer.
+
+> **Note**: HTTP mode requires authentication. For unauthenticated testing, use stdio mode with device code flow.
+>
+> **Authentication Tools**: In HTTP mode, login/logout tools are disabled by default since OAuth handles authentication.
+> Use `--enable-auth-tools` if you need them available.
+
+## Multi-Account Support
+
+Use a single server instance to serve multiple Microsoft accounts. When more than one account is logged in, an `account` parameter is automatically injected into every tool, allowing you to specify which account to use per tool call.
+
+**Login multiple accounts** (one-time per account):
+
+```bash
+# Login first account (device code flow)
+npx @softeria/ms-365-mcp-server --login
+# Follow the device code prompt, sign in as personal@outlook.com
+
+# Login second account
+npx @softeria/ms-365-mcp-server --login
+# Follow the device code prompt, sign in as work@company.com
+```
+
+**List configured accounts:**
+
+```bash
+npx @softeria/ms-365-mcp-server --list-accounts
+```
+
+**Use in tool calls:** Pass `"account": "work@company.com"` in any tool request:
+
+```json
+{ "tool": "list-mail-messages", "arguments": { "account": "work@company.com" } }
+```
+
+**Behavior:**
+
+- With a **single account** configured, it auto-selects (no `account` parameter needed).
+- With **multiple accounts** and no `account` parameter, the server uses the selected default or returns a helpful error listing available accounts.
+- **100% backward compatible**: existing single-account setups work unchanged.
+- The `account` parameter accepts email address (e.g. `user@outlook.com`) or MSAL `homeAccountId`.
+
+### Strict Account Pinning
+
+Headless stdio deployments can pin the local MSAL cache to one expected Microsoft account:
+
+```bash
+# Username matching is case-insensitive
+MS365_MCP_EXPECTED_USERNAME=work@company.com npx @softeria/ms-365-mcp-server --login
+
+# Or pin the exact MSAL homeAccountId shown by --list-accounts
+npx @softeria/ms-365-mcp-server --expected-home-account-id <homeAccountId> --login
+```
+
+Use `--list-accounts` to discover `homeAccountId` values. The MCP `list-accounts` tool intentionally hides account IDs, so use the CLI for exact ID pinning.
+
+Pinning is opt-in and local-MSAL only:
+
+- CLI values (`--expected-username`, `--expected-home-account-id`) take precedence over `MS365_MCP_EXPECTED_USERNAME` and `MS365_MCP_EXPECTED_HOME_ACCOUNT_ID`.
+- Supplying an empty pin value fails at startup instead of being ignored.
+- Username pins are compared case-insensitively; `homeAccountId` pins are exact.
+- If both pins are set, they must resolve to the same cached account.
+- Local stdio startup fails fast when the expected account is not in the token cache. Bootstrap by setting the pin, running `--login`, then starting the headless server.
+- Device-code and browser logins reject a missing or mismatched account before persisting the selected account or token cache.
+- Pinning collapses the effective MCP mode to single-account: the server does not advertise an `account` parameter and MCP instructions do not suggest account switching.
+- `--http`, `--obo`, and `MS365_MCP_OAUTH_TOKEN` use request-provided tokens for Graph calls, so account pins are warning-only in those modes. If HTTP auth tools are enabled, the pin still applies to those local MSAL helper flows.
+- `--logout` clears all cached accounts, including the pinned account. For surgical cleanup, prefer `--remove-account <id>`.
+
+> **For MCP multiplexers (Legate, Governor):** Multi-account mode replaces the N-process pattern. Instead of spawning one server per account, a single instance handles all accounts via the `account` parameter, reducing tool duplication from N×110 to 110.
+
+## Tool Presets
+
+To reduce initial connection overhead and token usage, use preset tool categories instead of loading the full tool set:
+
+```bash
+npx @softeria/ms-365-mcp-server --preset mail
+npx @softeria/ms-365-mcp-server --list-presets  # See all available presets
+```
+
+Available presets: `mail`, `calendar`, `files`, `personal`, `work`, `excel`, `contacts`, `tasks`, `onenote`, `search`, `users`, `outlook`, `onedrive`, `teams`, `teams-write`, `all`
+
+See **[PRESETS.md](PRESETS.md)** for the full list of tools each preset unlocks (regenerated on `npm run generate`).
+
+Each endpoint in `endpoints.json` declares which presets it belongs to via a `presets` array, so every preset is an exact tool-name allow-list that never over-matches across apps (e.g. `mail` does not include shared-mailbox tools; those are in `work`). The universal binary reader `download-bytes` is included in every preset except `teams-write`, so whatever an app returns (a file, an attachment, a photo, a recording) can always be fetched; `get-download-url` (a pre-authenticated URL for drive/SharePoint files) rides with the drive-backed presets, and joins every other preset (bar `teams-write`) when HTTP mode runs with `--enable-attachment-urls`. So a preset that can find a file can always read its bytes.
+
+The `outlook`, `onedrive` and `teams` presets are app-scoped: they expose exactly one Microsoft app. Use these for "expose exactly one app" deployments:
+
+```bash
+# Outlook only (mail + calendar + contacts; no shared mailboxes, no files)
+npx @softeria/ms-365-mcp-server --preset outlook
+
+# Teams only (requires --org-mode)
+npx @softeria/ms-365-mcp-server --org-mode --preset teams
+```
+
+The `teams-write` preset is the send-only counterpart to `--read-only`: send in chats, send/reply in channels, list chats/teams/channels by name, and activity notifications - no message reading and no byte downloaders. The requested token is minimal by construction (`Chat.ReadBasic`, the `*.Send` scopes, and basic team/channel listing - nothing that can read message content):
+
+```bash
+npx @softeria/ms-365-mcp-server --org-mode --preset teams-write
+```
+
+## Dynamic Tool Discovery
+
+Instead of loading every tool upfront, use dynamic discovery so the LLM finds and loads tools only when it needs them:
+
+```bash
+npx @softeria/ms-365-mcp-server --discovery
+```
+
+Keeps the initial context small and cuts token usage, especially useful for long sessions or cost-sensitive setups (e.g. Open WebUI running against a paid API).
+
+### Hybrid discovery with direct tools
+
+Keep the full enabled catalogue discoverable while exposing frequent operations directly:
+
+```bash
+npx @softeria/ms-365-mcp-server --org-mode --discovery \
+  --eager-tools list-mail-messages,get-calendar-view,download-bytes
+```
+
+`--eager-tools` accepts comma-separated **exact** Graph or utility tool names,
+not a regular expression or preset. `MS365_MCP_EAGER_TOOLS` is the environment
+fallback; the CLI wins. An empty or whitespace-only environment value is treated
+as unset, including without discovery; an explicitly empty CLI option is still
+invalid. The option requires `--discovery`. Empty entries and
+unknown names fail startup, including in HTTP mode. Duplicate names are registered once.
+
+Direct tools use the same schemas, annotations and execution handlers as normal
+mode. They also remain searchable and executable through discovery. Existing
+`--preset`, `--enabled-tools`, `--allowed-scopes`, `--read-only`, organization-mode
+and transport restrictions apply first: an eager selection cannot enable a
+filtered-out tool or add permissions. Recognized but unavailable tools are
+omitted with a diagnostic logged once per server instance. HTTP still excludes
+server-local file tools.
+
+Select a small set: exposing many generated Graph schemas can consume substantial
+model context. This option does not shrink individual schemas. Without
+`--eager-tools`, discovery and normal registration behave as before.
+
+## CLI Options
+
+The following options can be used when running ms-365-mcp-server directly from the command line:
+
+```
+--login           Login using device code flow
+--logout          Log out and clear saved credentials
+--verify-login    Verify login without starting the server
+--list-permissions List required Graph API permissions and exit (respects --org-mode, --preset, --enabled-tools, --enabled-tools-file, --allowed-scopes)
+--org-mode        Enable organization/work mode from start (includes Teams, SharePoint, etc.)
+--work-mode       Alias for --org-mode
+--force-work-scopes Backwards compatibility alias for --org-mode (deprecated)
+--cloud <type>    Microsoft cloud environment: global (default), china (21Vianet) or gcc-high
+--allowed-scopes <scopes> Limit exposed tools to Graph scopes covered by this allowlist
+--extra-scopes <scopes> Append additional Graph scopes to the token request (for use with your own app registration + graph-batch)
+--expected-username <username> Require local MSAL auth to use this account username
+--expected-home-account-id <id> Require local MSAL auth to use this exact homeAccountId
+```
+
+### Server Options
+
+When running as an MCP server, the following options can be used:
+
+```
+-v                Enable verbose logging
+--read-only       Start server in read-only mode, disabling write operations
+--http [port]     Use Streamable HTTP transport instead of stdio (optionally specify port, default: 3000)
+                  Starts Express.js server with MCP endpoint at /mcp. Bound to a loopback host
+                  (e.g. --http 127.0.0.1:3000 or --http [::1]:3000) with no --public-url, it
+                  rejects requests whose Host or Origin is not localhost (not applied to the
+                  --attachment-port listener)
+--http-local-file-tools Register download-bytes-to-file over HTTP. Anyone who can reach the port
+                  can write files as the server's user (without a valid token, only an empty
+                  file that is removed again), so enable it only on a single-user machine.
+                  With MS365_MCP_UPLOAD_DIRS set it also registers upload-attachment-from-file,
+                  which reads files from those directories.
+                  Refused unless --http binds a loopback host with no --public-url and no
+                  --trust-proxy-auth
+--app-mode        Use application permissions (client credentials) with no signed-in user. stdio only
+                  (see "App Mode" under Authentication)
+--enable-auth-tools Enable login/logout tools when using HTTP mode (disabled by default in HTTP mode)
+--enable-attachment-urls Let get-download-url mint a server-served URL for byte resources Graph
+                  exposes no pre-authenticated URL for (see "Server-Minted Attachment URLs").
+                  Also adds get-download-url to any --preset that lacks it (except teams-write)
+--attachment-port <port> Serve /attachment on its own listener on this port instead of on the
+                  MCP app, so a fetcher that can read attachments cannot also reach /mcp
+                  (requires --enable-attachment-urls; see "Splitting the attachment listener")
+--attachment-host <host> Interface the --attachment-port listener binds. Defaults to whatever
+                  --http bound, which with a wildcard --http leaves BOTH ports on every
+                  interface and so isolates nothing — set this to make the split real
+                  (requires --attachment-port; see "Splitting the attachment listener")
+--no-dynamic-registration Disable OAuth Dynamic Client Registration (enabled by default in HTTP mode)
+--enabled-tools <pattern> Filter tools using regex pattern (e.g., "excel|contact" to enable Excel and Contact tools)
+--enabled-tools-file <path> Filter tools using a file with one regex per line (same as --enabled-tools;
+                  blank lines and whole-line # comments ignored). Overrides --enabled-tools;
+                  overridden by --preset. Equivalent env var: ENABLED_TOOLS_FILE
+--preset <names>  Use preset tool categories (comma-separated). See "Tool Presets" section above
+--list-presets    List all available presets and exit
+--toon            (experimental) Enable TOON output format for 30-60% token reduction
+--blob-output     File download tools answer an MCP EmbeddedResource with the file instead of
+                  base64 JSON in a text block (see MS365_MCP_BLOB_OUTPUT below)
+--discovery       Dynamic tool discovery: loads tools on demand to reduce initial token usage (see "Dynamic Tool Discovery" above)
+--public-url <url> Public base URL for OAuth when behind a reverse proxy (see Open WebUI section and docs/deployment.md)
+```
+
+Environment variables:
+
+- `READ_ONLY=true|1`: Alternative to --read-only flag
+- `ENABLED_TOOLS`: Filter tools using a regex pattern (alternative to --enabled-tools flag)
+- `ENABLED_TOOLS_FILE`: Path to a file with one regex per line (alternative to --enabled-tools-file). Blank lines and whole-line `#` comments are dropped, then lines are joined with `|` (same as `ENABLED_TOOLS=line1|line2|…`). Layering (later wins): `--enabled-tools` → `--enabled-tools-file` → `--preset` → `ENABLED_TOOLS` → `ENABLED_TOOLS_FILE`
+- `MS365_MCP_ORG_MODE=true|1`: Enable organization/work mode (alternative to --org-mode flag)
+- `MS365_MCP_FORCE_WORK_SCOPES=true|1`: Backwards compatibility for MS365_MCP_ORG_MODE
+- `MS365_MCP_APP_MODE=true|1`: Enable app mode (alternative to --app-mode flag)
+- `MS365_MCP_CLIENT_CERTIFICATE_PATH=<path>`: PEM file with a certificate and its unencrypted private key, used instead of `MS365_MCP_CLIENT_SECRET` in app mode
+- `MS365_MCP_FEDERATED_TOKEN_FILE=<path>`: Federated token (workload identity federation), used instead of a secret or certificate in app mode
+- `MS365_MCP_MANAGED_IDENTITY=system|<client id>`: Use the host's managed identity in app mode, instead of an app registration
+- `MS365_MCP_OUTPUT_FORMAT=toon`: Enable TOON output format (alternative to --toon flag)
+- `MS365_MCP_MAX_TOP=<n>`: Hard cap for Graph `$top` / `top` on list requests (positive integer). When the model passes a larger value, the server clamps it to `n` so responses stay smaller. Example: `MS365_MCP_MAX_TOP=15`
+- `MS365_MCP_MAX_PAGES=<n>`: Maximum number of pages followed when a tool is called with `fetchAllPages: true` (positive integer, default `100`). Bounds memory and latency for large result sets.
+- `MS365_MCP_MAX_ITEMS=<n>`: Maximum number of items accumulated when `fetchAllPages: true` (positive integer, default `10000`). Pagination stops and the response is truncated once this many items are collected.
+- `MS365_MCP_TOOL_DEFINITION_BUDGET=<bytes>`: Opt in to trimming oversized request-body schemas so every tool fits a hosted connector's tool-definition budget (1 048 576 bytes of input schema per connector, admitted alphabetically — a tool that no longer fits is silently skipped). `4096` keeps a full org surface at ~78 % of that budget. Only bodies above the ration are trimmed, nested descriptions before structure, field names last. Unset (default): nothing is trimmed; the server still logs the total input-schema bytes served and, in HTTP mode, warns when the surface exceeds the connector budget.
+- `MS365_MCP_ALLOW_PAGINATION=0|false|no`: Disable multi-page following entirely. When set, the `fetchAllPages` parameter is not advertised on tools, and any request that still passes it returns only the first page (default: pagination enabled).
+- `MS365_MCP_BLOB_OUTPUT=true|1`: File download tools (`download-bytes`, `get-mail-message-mime`, `get-shared-mailbox-message-mime`, `get-mail-attachment-content`, `get-shared-mailbox-attachment-content`) answer a short JSON text block (`name`, `contentType`, `size`) and an MCP `EmbeddedResource` with `BlobResourceContents` (`uri`, `mimeType`, `blob`) instead of base64 JSON in text. The `uri`'s last segment is the optional `fileName` argument. Default: off. Alternative to the --blob-output flag.
+- `MS365_MCP_BLOB_MAX_BYTES=<n>`: With blob output on, the largest file a download tool reads (positive integer, default `5242880`). The server stops reading past it and answers an error naming the limit.
+- `MS365_MCP_BODY_FORMAT=html`: Return email bodies as HTML instead of plain text (default: text)
+- `MS365_MCP_OBO_ALLOWED_TENANTS=<ids>` / `MS365_MCP_OBO_ALLOWED_USERS=<ids>`: With `--obo`, only callers whose token `tid` (tenant id) / `oid` (user object id) is listed may use the server; others get 403 before any On-Behalf-Of exchange. Comma or space separated; unset = everyone. The claims are read without verifying the signature, which Entra verifies during the exchange, so a token that lies about them still gets no Graph token. A token Entra rejects at the exchange (bad signature, expired, wrong audience, consent needed) gets 401 with a `WWW-Authenticate` challenge so the client signs in again
+- `MS365_MCP_READ_MAIL_TEXT_MAX_CHARS=<n>`: Largest result `read-mail-text` returns, in characters (default `80000`). A larger result is refused whole, naming the largest messages, rather than cut (see Reading Mail as Clean Text below)
+- `MS365_MCP_MESSAGE_SIGNOFF_PREFIX=<text>`: Signoff prepended to outgoing messages so recipients can tell they were agent-sent, e.g. `🤖`. Default: none. CLI equivalent: `--message-signoff-prefix <text>` (see Message Signoff below)
+- `MS365_MCP_MESSAGE_SIGNOFF_SUFFIX=<text>`: Signoff appended to outgoing messages. Default: none. CLI equivalent: `--message-signoff-suffix <text>`. `--no-message-signoff` disables both (see Message Signoff below)
+- `MS365_MCP_RATE_LIMIT_DISABLED=true|1`: Disable per-IP rate limiting in HTTP mode (default: enabled — 30 req/min on `/authorize`, `/token`, `/register`; 120 req/min on `/mcp`)
+- `MS365_MCP_TRUST_PROXY_HOPS=<n>`: Number of trusted reverse-proxy hops in HTTP mode (default `1`). Accurate per-IP rate limiting depends on this matching your deployment — set to the number of proxies in front of the server, `0` to use the raw socket peer IP, or a comma-separated subnet list
+- `MS365_MCP_ATTACHMENT_PORT=<port>`: Serve the attachment route on its own listener on this port (alternative to --attachment-port; requires `--enable-attachment-urls`)
+- `MS365_MCP_ATTACHMENT_HOST=<host>`: Interface the `MS365_MCP_ATTACHMENT_PORT` listener binds (alternative to --attachment-host; requires `--attachment-port`). Defaults to the host `--http` bound — which for a wildcard `--http` means both ports answer everywhere and the port split isolates nothing. See "Splitting the attachment listener"
+- `MS365_MCP_HTTP_LOCAL_FILE_TOOLS=true|1`: Register download-bytes-to-file, and upload-attachment-from-file when `MS365_MCP_UPLOAD_DIRS` is set, over HTTP (alternative to --http-local-file-tools; same restrictions)
+- `MS365_MCP_UPLOAD_DIRS=<dirs>`: Directories `upload-attachment-from-file` may read from, as absolute paths separated like `PATH`. Unset (the default) leaves the tool unregistered. See "Attaching a local file in stdio mode"
+- `MS365_MCP_CLOUD_TYPE=global|china|gcc-high`: Microsoft cloud environment (alternative to --cloud flag)
+- `MS365_MCP_GRAPH_BASE_URL=<url>`: Send Graph API requests to this base URL instead of the cloud's `graph.microsoft.com` (e.g. `http://127.0.0.1:10255/tenant-a/graph` for an egress proxy that originates TLS itself). Absolute http(s) URL without query or fragment; a path prefix is kept, so requests go to `<url>/v1.0/...`. The login authority and the On-Behalf-Of token resource are unchanged. Two things bypass it: `get-download-url` returns Graph's pre-authenticated SharePoint URL, and the `302` from `/content` points straight at SharePoint, so whoever follows either connects to SharePoint directly; if you control egress, allow those SharePoint hosts or disable those tools. Not read from `.env`
+- `LOG_LEVEL`: Set logging level (default: 'info')
+- `SILENT=true|1`: Disable console output
+- `MS365_MCP_REDACT_PII=false|0`: Disable scrubbing of JWTs, Bearer headers, OAuth token fields, and email addresses from log messages (default: enabled). The server handles live Graph bearer tokens, so redaction is on unless you opt out for fully verbose local debugging.
+- `MS365_MCP_CLIENT_ID`: Custom Azure app client ID (defaults to built-in app)
+- `MS365_MCP_TENANT_ID`: Custom tenant ID (defaults to 'common' for multi-tenant). **Personal Microsoft accounts should set this to `consumers`** - as of June 2026, refresh tokens issued via the default 'common' authority are rejected at the first refresh, so sessions die roughly an hour after login
+- `MS365_MCP_OAUTH_TOKEN`: Pre-existing OAuth token for Microsoft Graph API (BYOT method)
+- `MS365_MCP_KEYVAULT_URL`: Azure Key Vault URL for secrets management (see Azure Key Vault section)
+- `MS365_MCP_TOKEN_CACHE_PATH`: Custom file path for MSAL token cache (see Token Storage below)
+- `MS365_MCP_SELECTED_ACCOUNT_PATH`: Custom file path for selected account metadata (see Token Storage below)
+- `MS365_MCP_AUTH_CACHE_COMMAND`: External executable wrapper for provider-neutral auth-cache storage (see Token Storage below)
+- `MS365_MCP_AUTH_CACHE_COMMAND_TIMEOUT_MS`: Per-invocation timeout for `MS365_MCP_AUTH_CACHE_COMMAND` (default: `10000`)
+- `MS365_MCP_EXPECTED_USERNAME`: Require local MSAL auth to use this Microsoft account username (case-insensitive; CLI flag takes precedence)
+- `MS365_MCP_EXPECTED_HOME_ACCOUNT_ID`: Require local MSAL auth to use this exact MSAL homeAccountId (CLI flag takes precedence)
+
+## Interactive Views (MCP Apps)
+
+Hosts that render MCP Apps get an inbox, a conversation reader and a draft composer for the Outlook mail tools, so mail can be reviewed before anything is sent. Tool results are unchanged. Turn the views off with `--no-app-views` or `MS365_MCP_DISABLE_APP_VIEWS=true`. See [docs/interactive-views.md](docs/interactive-views.md).
+
+## Reading Mail as Clean Text
+
+`read-mail-text` returns messages as text with the bulk junk removed. Graph's
+plain-text body is still mostly not the message: links are wrapped in Safe Links
+or tracking redirects several hundred characters long, marketing mail pads its
+preheader with invisible characters, images become `[https://…png]` lines, and
+replies carry the whole quoted thread. On a real mailbox, 20 inbox messages came
+to about 280,000 characters through `list-mail-messages` and 70,000 through
+`read-mail-text`.
+
+The rule is: remove obvious junk, never cut or rewrite the message; anything
+ambiguous is kept. It removes runs of invisible padding characters, image
+placeholders (a bracketed address of an image file), and quoted reply history
+from its header down (a dated `On … wrote:`, also `>`-quoted, an Outlook
+`From:/Sent:` block, `-----Original Message-----`). Forwards keep the forwarded
+content: a subject starting `FW:` / `Fwd:` or a localised prefix (`VS:`, `WG:`,
+`TR:`, `RV:`, `I:`, `ENC:`, …, also after tags such as `[EXTERNAL]`), or history
+directly under a `Forwarded message` / `Begin forwarded message:` marker. Links are kept:
+Safe Links, Proofpoint URL Defense and Google redirects are unwrapped to the real
+address, tracking parameters (`utm_*` and similar) are dropped, and only an
+address still longer than 300 characters (a tracking redirect) is shortened to
+`⟦link: domain⟧`. Line endings become `\n`, and the marker brackets are
+reserved: a body's own `⟦ ⟧` appear as `[ ]`, so text cannot pose as a marker.
+Everything else — signatures, footers, whitespace, repeated links — is left as
+the message has it. `get-mail-message` returns the raw body.
+
+- `messageIds` (up to 20, one `$batch`), or `folderId` with optional `top`
+  (max 20), `filter` or `search`.
+- Each message is cut to `maxChars` characters, default 3,000 (marked
+  `truncated`): a page of 20 then fits the result limit, and a typical message
+  is whole. Ticket systems that repeat their history in every update put the
+  newest entry first, so the cut keeps it. Pass a larger `maxChars` (up to
+  300,000; a raw body beyond that is cleaned only that far) for the whole of a
+  long message; `get-mail-message` has the raw body.
+- Returns `[{ id, from, to, cc, subject, received, hasAttachments, text, chars, truncated }]`;
+  an unknown id comes back as `{ id, error }`.
+- A result over `MS365_MCP_READ_MAIL_TEXT_MAX_CHARS` (default 80,000) is refused
+  whole with the largest messages listed, so the agent narrows the query instead
+  of silently getting part of it.
+
+## Server-Minted Attachment URLs
+
+`get-download-url` returns Microsoft's own pre-authenticated `@microsoft.graph.downloadUrl`
+for OneDrive and SharePoint items. Graph publishes no such URL for **mail and calendar
+attachments, meeting recordings, or any other `/$value` byte endpoint** — for those, the
+only way to read the bytes has been `download-bytes`, which returns base64 into the
+agent's context. A 73 KB, 3-page PDF costs about 24,500 tokens that way, and the model
+cannot parse them anyway.
+
+`--enable-attachment-urls` (HTTP mode, off by default) closes that gap. When Graph has no
+URL of its own, `get-download-url` mints one this server serves. With it on,
+`get-download-url` is registered under every `--preset` (except the send-only `teams-write`),
+so a `--preset mail` agent that lists an attachment can mint a URL for it. A minted URL only
+works if the preset's scopes cover the resource: a contacts, tasks or excel preset has no Mail
+scopes, so a URL minted for a mail attachment fails when fetched.
+
+The minted URL looks like:
+
+```
+GET /attachment?t=<ticket>&dgk=<key-id>&dgx=<expiry>&dgs=<signature>
+```
+
+The ticket is 32 bytes of CSPRNG output, **single-use**, memory-only, and expires after
+`MS365_MCP_ATTACHMENT_URL_TTL_S` seconds. Redeeming it streams the Graph bytes as the
+identity that minted it; the fetcher sends no Authorization header and holds no Microsoft
+credential.
+
+**This grants no authority the calling agent did not already have.** Every target that can
+be minted is one `download-bytes` would fetch for the same caller on the same account. The
+ticket only moves those bytes out of the context window and into a direct transfer.
+
+### Uploading attachments the same way
+
+The same ticket store works in the other direction. `get-upload-url` mints a URL for
+attaching a file to a draft message or an event, so the bytes go straight from the caller
+to Graph instead of passing as base64 `contentBytes` through the agent context:
+
+```
+PUT /attachment?t=<ticket>&dgk=<key-id>&dgx=<expiry>&dgs=<signature>
+Content-Length: <file size>
+
+<raw file bytes>
+```
+
+`target` is the item's attachments collection (`/me/messages/{id}/attachments` for a draft,
+`/me/events/{id}/attachments` for an event); `name` and `contentType` are recorded on the
+attachment. Files under 3 MB are attached inline; larger ones, up to Graph's 150 MB, stream
+through an upload session in 3.75 MiB chunks, so the server never holds more than one chunk.
+`Content-Length` is required. The ticket is single-use and burnt on first presentation
+whatever the outcome, and the upload is attached as the identity that minted it, exactly as
+downloads are fetched. An upload ticket presented to `GET` (or a download ticket to `PUT`)
+is refused with the same 404 as any other bad ticket.
+
+### Attaching a local file in stdio mode
+
+In stdio mode the server and the files are on the same machine, so no URL is needed.
+`upload-attachment-from-file` takes the same `target` and an absolute `filePath`, reads the
+file from disk and attaches it, with the same 3 MB and 150 MB limits. It is the upload
+counterpart of `download-bytes-to-file`.
+
+The tool is off until you list the directories it may read from:
+
+```
+MS365_MCP_UPLOAD_DIRS=/Users/me/Documents/invitations:/Users/me/Scans
+```
+
+Entries are absolute paths, separated like `PATH` (`:` on macOS and Linux, `;` on Windows).
+A file outside them is refused, and symlinks are resolved first, so a link inside an allowed
+directory cannot point the read somewhere else. The variable is not read from `.env`.
+
+Over HTTP the tool is registered only with `--http-local-file-tools`, like
+`download-bytes-to-file`.
+
+### Configuration
+
+```
+MS365_MCP_ATTACHMENT_URL_BASE=http://m365-mcp:3000   # required
+MS365_MCP_ATTACHMENT_URL_KEY=...                     # required (or _KEY_FILE=/path), see below
+MS365_MCP_ATTACHMENT_URL_KEY_ID=1                    # optional, default 1; needs a key
+MS365_MCP_ATTACHMENT_URL_TTL_S=120                   # optional, default 120, max 300
+```
+
+`MS365_MCP_ATTACHMENT_URL_BASE` is deliberately **not** `MS365_MCP_PUBLIC_URL`: that one is
+browser-facing, for OAuth redirects, while this is fetched server-to-server and is
+commonly a container address. A missing or malformed setting fails at startup rather than
+per-request.
+
+The signing key is required: a minted URL is a capability for someone's attachment, so it is signed
+and the fetcher (such as a docglean-mcp sidecar) verifies the `dgk`/`dgx`/`dgs` signature (see below).
+Startup is refused without `MS365_MCP_ATTACHMENT_URL_KEY` or `_KEY_FILE`, and with a `_KEY_FILE` that is
+empty or unreadable. The ticket store is in process memory, so run one replica.
+
+### Splitting the attachment listener
+
+By default `/attachment` is served by the same Express app, on the same port, as `/mcp`.
+That is fine when callers are authenticated by a bearer token, and it is a problem when
+they are not. Under `--trust-proxy-auth` the MCP endpoint reads no `Authorization` header
+at all — **reachability is the authentication** — so one shared port means the sidecar you
+allowed through in order to fetch a PDF can also call every tool on the server.
+
+> **`--trust-proxy-auth` is single-user only.** The server now refuses it on any non-loopback bind
+> (see the production checklist in `docs/deployment.md`), so the container-network layout below is for
+> bearer-authenticated deployments: the commands omit `--trust-proxy-auth`, and the sidecar still
+> cannot call a tool without a token. It also needs `MS365_MCP_ATTACHMENT_URL_KEY` and one replica.
+
+`--attachment-port <port>` (or `MS365_MCP_ATTACHMENT_PORT`) moves the route onto a listener
+of its own, and `--attachment-host <host>` (or `MS365_MCP_ATTACHMENT_HOST`) says which
+interface that listener binds:
+
+```
+ms-365-mcp-server --http 10.89.0.2:3000 \
+                  --enable-attachment-urls \
+                  --attachment-port 3001 --attachment-host 10.89.1.2
+MS365_MCP_ATTACHMENT_URL_BASE=http://m365-mcp:3001   # note: the attachment port
+```
+
+- `GET /attachment` on **3001** works; on 3000 it is **404** — the MCP app never mounts it.
+- `/mcp` on **3001** is **404**, as is everything else: the second app has the attachment
+  route and nothing more. No OAuth router, no body parsers, no CORS, no health check.
+- The 60 req/min limiter that guards the route follows it onto the new listener.
+- `trust proxy` is **off** on the attachment listener (and `MS365_MCP_TRUST_PROXY_HOPS` is
+  not read for it), unlike the MCP listener, which trusts one hop. This port is meant to be
+  dialled directly on a container network; honouring `X-Forwarded-For` on the server's one
+  uncredentialed surface would let a caller choose its own rate-limit bucket.
+
+The flag requires `--enable-attachment-urls` and refuses to start without it — on its own
+it would open a port with nothing on it while the operator believed the surfaces were
+separated. In stdio mode it warns and is ignored, like the flag it depends on.
+`--attachment-host` likewise requires `--attachment-port`: alone it would name an interface
+for a listener that does not exist.
+
+#### Two ports are not two surfaces unless they bind two interfaces
+
+**This is the part that decides whether any of the above is worth anything.** Read it
+before you deploy the split.
+
+`--attachment-port` on its own separates the two surfaces _inside the process_. It does not
+separate them _on the network_. Without `--attachment-host` the attachment listener inherits
+whatever host `--http` bound — and `--http 3000`, the common form, names no host at all, so
+Node binds the wildcard and **both** ports answer on **every** interface:
+
+```
+ms-365-mcp-server --http 3000 \
+                  --enable-attachment-urls --attachment-port 3001   # NOT isolated
+```
+
+Container networks grant a peer every port on a container, not one port. Put a
+document-conversion sidecar on a shared bridge so it can fetch `/attachment` on 3001, and
+that same sidecar can dial `:3000/mcp` — which under `--trust-proxy-auth` reads no
+`Authorization` header at all and hands back the full tool catalogue. Nothing fails, nothing
+is logged as an error, and the config looks exactly like the isolated one.
+
+To make it real, give the two listeners **different addresses**, and put only the attachment
+address on the network the fetcher is on:
+
+```yaml
+# docker compose — the MCP port on the agent's own bridge, the attachment port on the
+# bridge shared with the converter. The converter can reach 3001 and cannot route to 3000.
+services:
+  m365-mcp:
+    networks: { agent-net: { ipv4_address: 10.89.0.2 }, convert-net: { ipv4_address: 10.89.1.2 } }
+    command: >
+      --http 10.89.0.2:3000 --trust-proxy-auth
+      --enable-attachment-urls
+      --attachment-port 3001 --attachment-host 10.89.1.2
+  docglean:
+    networks: [convert-net]
+```
+
+The MCP port is then unreachable from `convert-net` **by binding** — there is no socket
+listening on that interface — rather than by a firewall rule that has to keep matching.
+
+The server warns at startup if you run `--trust-proxy-auth` with `--attachment-port` while
+both listeners still answer on a common interface (either sharing an address, or either one
+on the wildcard). Both bound addresses are logged, read back from the socket rather than
+from the flags, so `Server listening on …` and `Attachment listener on …` can be compared
+directly.
+
+`--attachment-host` takes a bare IPv4 address, IPv6 address (bracketed `[::1]` or bare
+`::1`) or hostname. It is refused rather than coerced — `--attachment-host 10.0.0.5:3001`
+is an error naming `--attachment-port`, not a bind to something else. Note that
+with a signing key set, `MS365_MCP_ATTACHMENT_URL_BASE` must not be an IPv6 literal (the URL
+signature covers the host and the two implementations normalise IPv6 differently); if you
+bind the listener to an IPv6 address, name it in the base by hostname. Without a key there
+is no such restriction.
+
+Point `MS365_MCP_ATTACHMENT_URL_BASE` at the attachment port. The server cannot check this
+for you: the base is usually a container name on a network this process cannot resolve, so
+a wrong port here shows up as a fetch failure in the sidecar, not an error here. Both the
+base and the bound port are logged at startup, one line apart, for exactly that comparison.
+
+### The signature, and who checks what
+
+This server never checks `dgk`/`dgx`/`dgs` on redemption, and that is deliberate.
+They exist for the fetcher: a document-conversion sidecar that refuses to dial a private
+address unless the URL carries a valid HMAC from an origin it has been configured to trust.
+What authorises redemption _here_ is the ticket. Verifying the signature on the way back in
+would prove only that we minted the URL — which the ticket already proves — while coupling
+redemption to the sidecar's clock and to the key surviving a restart.
+
+The wire format is [docglean-mcp](https://github.com/msoukhomlinov/docglean-mcp)'s
+`signing.py` (`canonical_string`), and `src/lib/url-signing.ts` is a port of it. The
+canonical string is `\n`-joined: `v1`, lowercased scheme, lowercased host, the port always
+explicit, the path, the remaining query with `dgk`/`dgx`/`dgs` removed and the rest sorted
+and re-encoded, and the expiry. The test vectors in
+`test/attachment-url-signing.test.ts` were verified against the Python implementation byte
+for byte — three places where the obvious JavaScript disagrees with Python (`!*'()`
+escaping, `+` decoding as a space, and code-point vs UTF-16 sort order) are why that check
+exists rather than being assumed.
+
+The ticket travels in the **query, not the path**, because the verifying sidecar keeps a
+fetched URL's path in its error messages and strips the query.
+
+### Whose identity the bytes are read as
+
+Under `--trust-proxy-auth` the server reads with its own cached account, and redemption
+looks that account up again.
+
+In plain `--http` and `--obo`, identity arrives per request on the caller's
+`Authorization` header, and a ticket is redeemed later by a fetcher that sends none. So
+the ticket keeps the Graph token the minting request used (the exchanged one, under
+`--obo`) and redemption reads with that token and nothing else. It stays in server memory
+and is never part of the URL.
+
+With `MS365_MCP_OAUTH_TOKEN` set, the ticket keeps that token instead, `--trust-proxy-auth`
+or not.
+
+A token kept this way cannot be refreshed. If it expires before the URL is fetched,
+redemption answers 502. The agent can mint again once its client has a fresh token; an
+expired `MS365_MCP_OAUTH_TOKEN` has to be replaced by the operator.
+
+Tickets live in the memory of the process that minted them, so a URL has to be redeemed
+on the same instance. Behind a load balancer that means one replica or sticky routing.
+
+## Token Storage
+
+Authentication tokens are stored in an encrypted file (AES-256-GCM). Only the 32-byte encryption key goes to the OS credential store via keytar.
+
+The cache itself is too big for some credential stores to hold - a Windows Credential Manager blob caps out at 2560 bytes and a real token cache is several times that, so on Windows the write could never succeed. A key is 32 bytes regardless of how many accounts are signed in, so this works the same way on every platform.
+
+**Default paths** are in the per-user config directory:
+
+| Platform | Location                                                                  |
+| -------- | ------------------------------------------------------------------------- |
+| Windows  | `%APPDATA%\ms-365-mcp-server\`                                            |
+| macOS    | `~/Library/Application Support/ms-365-mcp-server/`                        |
+| Linux    | `$XDG_CONFIG_HOME/ms-365-mcp-server/` (or `~/.config/ms-365-mcp-server/`) |
+
+Earlier versions defaulted to a path inside the installed package, which under `npx` resolves to a content-hashed cache directory that `npm cache clean` or a version bump throws away. A cache still sitting in the package directory is moved to the new location on first run.
+
+That covers global and local installs, and `npx` when the hash has not changed. It cannot reach a cache left behind in a _previous_ `npx` hash directory, so upgrading an `npx` install one last time means signing in again. Adopting a cache from another directory would mean trusting a directory this package cannot prove it wrote, which is not worth one saved sign-in.
+
+Override the paths if you need to:
+
+```bash
+export MS365_MCP_TOKEN_CACHE_PATH="$HOME/.config/ms365-mcp/.token-cache.json"
+export MS365_MCP_SELECTED_ACCOUNT_PATH="$HOME/.config/ms365-mcp/.selected-account.json"
+```
+
+Parent directories are created automatically. Files are written with `0600` permissions.
+
+**Without a credential store** (headless Linux, most containers) the key is written to `.cache-key` next to the cache file, with `0600` permissions. That stops the tokens showing up in a stray `cat`, a backup or an accidental commit. It does not protect against anyone who can already read the directory - the key is right there. Use `MS365_MCP_AUTH_CACHE_COMMAND` below if you need the cache in a real secret store.
+
+**Skipping the credential store on purpose:**
+
+```bash
+export MS365_MCP_USE_KEYTAR=0   # also accepts false, no or off
+```
+
+The key then goes to `.cache-key` on every platform, exactly as it does where no credential store exists, and nothing in the server calls keytar. Useful when the credential store prompts on each start - macOS re-asks whenever the calling binary changes, which under `npx` is every version bump - or when the native module misbehaves on your platform rather than simply failing to load. Any other value leaves the credential store in use, and an unrecognised one is warned about rather than passed over silently.
+
+Switching it off strands a cache that was encrypted under a key already in the credential store, since nothing can reach that key any more. The server says so and replaces that cache on the next sign-in, which signs out **every** account it held, not just the one you sign back in as. Unset the variable first if that cache is worth keeping.
+
+Only a cache that nothing on the machine can open is replaced. One that fails to decrypt while a usable key is sitting right there - a truncated file, a downgrade to an older build, a cache from somewhere else - is damage rather than a stranded cache, and is left alone exactly as it is by default.
+
+Two things it deliberately does not do. It never deletes what this server already put in the credential store, on logout or otherwise, because reaching the store is the thing you just asked it to stop doing - clear the `ms-365-mcp-server` entries by hand if you want them gone. And a `.cache-key` that exists but cannot be read (wrong owner on a bind-mounted config directory, say) is treated as recoverable rather than missing: the server refuses both to overwrite a cache and to mint a replacement key, and says so, rather than deleting a key that would work again once the permissions are fixed. Fix the permissions, or delete `.cache-key` yourself to start over - which does mean signing in again.
+
+If the cache cannot be decrypted - key lost, keychain locked, file modified - you are asked to sign in again rather than the server failing to start. The cache file is left exactly as it was: not deleted, and not overwritten by that new sign-in either. A keychain that is merely locked usually reads fine on the next start, and the cache is still there when it does.
+
+The cost is that the new session is not saved while this lasts, so each start asks you to sign in again. If the key is genuinely gone and the cache will never open, delete `.token-cache.json` to start over - the log says so, and names the path.
+
+> **Hosted/sandboxed environments** (e.g. Anthropic Cowork): Set `MS365_MCP_TOKEN_CACHE_PATH` and `MS365_MCP_SELECTED_ACCOUNT_PATH` to a persistent mount so tokens survive between sessions.
+
+### External auth-cache command
+
+Headless local-MSAL deployments can replace the built-in keytar/file storage with a provider-neutral external command:
+
+```bash
+export MS365_MCP_AUTH_CACHE_COMMAND="/path/to/ms365-auth-cache-store"
+export MS365_MCP_AUTH_CACHE_COMMAND_TIMEOUT_MS=10000
+```
+
+When `MS365_MCP_AUTH_CACHE_COMMAND` is set for a local auth flow, the server uses only that command for the MSAL token cache and selected-account metadata. It does not fall back to keytar or local files. If the command path is missing, not executable on POSIX, exits non-zero, times out, or returns malformed data, auth-cache operations fail closed with a sanitized error message.
+
+The value must be a real executable wrapper path. It is not a shell command string, and there is no companion args environment variable. Put any interpreter, region, profile, or provider-specific settings inside the wrapper. Windows users should point the variable at a wrapper executable or script that can be launched directly by Node without shell parsing.
+
+The server invokes the wrapper with:
+
+```text
+$MS365_MCP_AUTH_CACHE_COMMAND load token-cache
+$MS365_MCP_AUTH_CACHE_COMMAND save token-cache
+$MS365_MCP_AUTH_CACHE_COMMAND delete token-cache
+$MS365_MCP_AUTH_CACHE_COMMAND load selected-account
+$MS365_MCP_AUTH_CACHE_COMMAND save selected-account
+$MS365_MCP_AUTH_CACHE_COMMAND delete selected-account
+```
+
+Protocol v1:
+
+- `load <key>` reads no stdin. Exit `0` with `{"found":true,"value":"<stored envelope string>"}` when present. A miss is exit `0` with `{"found":false}` or empty stdout.
+- `save <key>` receives `{"value":"<stamped envelope string>"}` on stdin and must exit `0` only after the value is durably committed. There are no fire-and-forget or coalesced saves in v1.
+- `delete <key>` reads no stdin and exits `0` whether the key existed or not.
+- `<key>` is `token-cache` or `selected-account`.
+- Any non-zero exit is a storage error. Do not use exit code `2` for cache misses.
+- Stderr is captured and truncated in sanitized errors. Stdin and stdout payloads are never logged by the server.
+- Token-cache payloads can be large; wrappers should handle at least 256 KB values.
+
+Normal stateless HTTP Graph requests do not use local auth-cache storage. In HTTP mode, command storage is skipped at startup and per request unless local auth tools are explicitly enabled or a local account command such as `--login`, `--verify-login`, `--list-accounts`, `--select-account`, or `--logout` is used.
+
+## Azure Key Vault Integration
+
+For production deployments, you can store secrets in Azure Key Vault instead of environment variables. This is particularly useful for Azure Container Apps with managed identity.
+
+### Setup
+
+1. **Create a Key Vault** (if you don't have one):
+
+   ```bash
+   az keyvault create --name your-keyvault-name --resource-group your-rg --location eastus
+   ```
+
+2. **Add secrets to Key Vault**:
+
+   ```bash
+   az keyvault secret set --vault-name your-keyvault-name --name ms365-mcp-client-id --value "your-client-id"
+   az keyvault secret set --vault-name your-keyvault-name --name ms365-mcp-tenant-id --value "your-tenant-id"
+   # Optional: if using confidential client flow
+   az keyvault secret set --vault-name your-keyvault-name --name ms365-mcp-client-secret --value "your-secret"
+   ```
+
+3. **Grant access to Key Vault**:
+
+   For Azure Container Apps with managed identity:
+
+   ```bash
+   # Get the managed identity principal ID
+   PRINCIPAL_ID=$(az containerapp show --name your-app --resource-group your-rg --query identity.principalId -o tsv)
+
+   # Grant access to Key Vault secrets
+   az keyvault set-policy --name your-keyvault-name --object-id $PRINCIPAL_ID --secret-permissions get list
+   ```
+
+   For local development with Azure CLI:
+
+   ```bash
+   # Your Azure CLI identity already has access if you have appropriate RBAC roles
+   az login
+   ```
+
+4. **Configure the server**:
+   ```bash
+   MS365_MCP_KEYVAULT_URL=https://your-keyvault-name.vault.azure.net npx @softeria/ms-365-mcp-server
+   ```
+
+### Secret Name Mapping
+
+| Key Vault Secret Name   | Environment Variable    | Required                  |
+| ----------------------- | ----------------------- | ------------------------- |
+| ms365-mcp-client-id     | MS365_MCP_CLIENT_ID     | Yes                       |
+| ms365-mcp-tenant-id     | MS365_MCP_TENANT_ID     | No (defaults to 'common') |
+| ms365-mcp-client-secret | MS365_MCP_CLIENT_SECRET | No                        |
+
+### Authentication
+
+The Key Vault integration uses `DefaultAzureCredential` from the Azure Identity SDK, which automatically tries multiple authentication methods in order:
+
+1. Environment variables (AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID)
+2. Managed Identity (recommended for Azure Container Apps)
+3. Azure CLI credentials (for local development)
+4. Visual Studio Code credentials
+5. Azure PowerShell credentials
+
+### Optional Dependencies
+
+The Azure Key Vault packages (`@azure/identity` and `@azure/keyvault-secrets`) are optional dependencies. They are only loaded when `MS365_MCP_KEYVAULT_URL` is configured. If you don't use Key Vault, these packages are not required.
+
+## Message Signoff
+
+Outgoing messages can be wrapped in a configurable signoff (e.g. a `🤖` prefix) so recipients can tell agent-sent messages from ones you typed yourself. Off by default — enable it with `--message-signoff-prefix` / `--message-signoff-suffix` (env: `MS365_MCP_MESSAGE_SIGNOFF_PREFIX` / `MS365_MCP_MESSAGE_SIGNOFF_SUFFIX`); `--no-message-signoff` or an empty env value turns it back off.
+
+Once configured, it applies to all Teams messages (sends, replies and edits, including via `graph-batch`), to direct mail sends (`send-mail`, reply/forward, their shared-mailbox variants, and group thread replies), and to mail drafts as their content is written — `send-draft-message` sends a draft as-is, so a draft you wrote yourself goes out untouched. A message that already carries the marker is not signed twice, and a send whose body cannot take the signoff is refused rather than sent unsigned.
+
+Markers may contain markup (e.g. a coloured `<span>`) as long as it renders visible text. Note that the signoff is a guardrail against an agent misusing the tools it was given, not a hard security boundary — an agent with shell access on the same machine could simply restart the server without it.
+
+## Production Deployment
+
+See [docs/deployment.md](docs/deployment.md) for a full guide to hosting the server for organization-wide access, including Docker, Azure Container Apps, Azure App Service, Azure AD app registration, reverse proxy setup, client configuration, and exposed endpoints.
+
+## Contributing
+
+We welcome contributions! Before submitting a pull request, please ensure your changes meet our quality standards.
+
+Run the verification script to check all code quality requirements:
+
+```bash
+npm run verify
+```
+
+### For Developers
+
+After cloning the repository, you may need to generate the client code from the Microsoft Graph OpenAPI specification:
+
+```bash
+npm run generate
+```
+
+## Related Projects
+
+- [ms-365-admin-mcp-server](https://github.com/okapi-ca/ms-365-admin-mcp-server) by [@okapi-ca](https://github.com/okapi-ca): companion server for admin/daemon scenarios using application permissions (client credentials flow), covering security alerts, audit logs, service health, and usage reports.
+
+## Support
+
+If you're having problems or need help:
+
+- Create an [issue](https://github.com/softeria/ms-365-mcp-server/issues)
+- Start a [discussion](https://github.com/softeria/ms-365-mcp-server/discussions)
+- Email: eirikb@eirikb.no
+- Discord: https://discord.gg/WvGVNScrAZ or @eirikb
+
+## License
+
+MIT © 2026 Softeria

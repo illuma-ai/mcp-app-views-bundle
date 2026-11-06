@@ -1,0 +1,45 @@
+name: Nightly Pre-release
+
+permissions:
+  contents: read
+  id-token: write # Required for OIDC
+
+on:
+  schedule:
+    - cron: "0 22 * * *" # Runs every day at 22:00 UTC (midnight CEST during daylight saving time)
+  workflow_dispatch:
+
+jobs:
+  pre-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      # npm 11.5.1 or later is required for OIDC integration
+      - name: Update npm
+        run: npm install -g npm@latest
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build the project
+        run: npm run build --if-present
+
+      - name: Run tests
+        run: npm test
+
+      - name: Publish to npm with nightly version
+        shell: pwsh
+        run: |
+          $dateString = Get-Date -Format "yyyyMMdd"
+          $currentVersion = (npm pkg get version).Trim('"')
+          npm version "$currentVersion-nightly.$dateString" --no-git-tag-version
+          npm publish --access public --tag nightly --tag next --provenance

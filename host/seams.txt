@@ -1,0 +1,15 @@
+api/server/controllers/mcpApps.js
+api/server/routes/__tests__/config.spec.js
+api/server/routes/__tests__/mcp.spec.js
+api/server/routes/config.js
+api/server/routes/mcp.js
+client/src/Providers/MCPAppsPolicyContext.tsx
+client/src/components/MCPUIResource/MCPAppViews.tsx
+client/src/components/MCPUIResource/__tests__/MCPAppViews.test.tsx
+client/src/components/Messages/Content/Error/registry.ts
+client/src/hooks/MCP/useAppBridge.ts
+packages/api/src/agents/hitl/modes.ts
+packages/api/src/agents/index.ts
+packages/api/src/agents/initialize.ts
+packages/api/src/mcp/apps/controller.ts
+packages/data-provider/src/config.ts

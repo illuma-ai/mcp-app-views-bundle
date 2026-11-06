@@ -1,0 +1,496 @@
+import { Command, Option } from 'commander';
+import { readFileSync } from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { readEnabledToolsFromFile } from './lib/enabled-tools-file.js';
+import { assertSignoffMarkersVisible } from './lib/message-signoff.js';
+import { assertUploadDirsAbsolute } from './lib/upload-dirs.js';
+import { getCombinedPresetPattern, listPresets, presetRequiresOrgMode } from './tool-categories.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const packageJsonPath = path.join(__dirname, '..', 'package.json');
+const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
+const version = packageJson.version;
+
+const program = new Command();
+
+program
+  .name('ms-365-mcp-server')
+  .description('Microsoft 365 MCP Server')
+  .version(version)
+  .option('-v', 'Enable verbose logging')
+  .option('--login', 'Login to Microsoft account')
+  .option('--logout', 'Log out and clear saved credentials')
+  .option('--verify-login', 'Verify login without starting the server')
+  .option('--list-accounts', 'List all cached accounts')
+  .option('--select-account <accountId>', 'Select a specific account by ID')
+  .option('--remove-account <accountId>', 'Remove a specific account by ID')
+  .option(
+    '--expected-username <username>',
+    'Require local MSAL authentication to use this Microsoft account username'
+  )
+  .option(
+    '--expected-home-account-id <id>',
+    'Require local MSAL authentication to use this exact MSAL homeAccountId'
+  )
+  .option('--read-only', 'Start server in read-only mode, disabling write operations')
+  .option(
+    '--message-signoff-prefix <text>',
+    'Signoff prepended to outgoing messages (Teams sends, replies and edits; mail sends and drafts) so recipients can tell they were agent-sent, e.g. 🤖 (default: none). Equivalent env var: MS365_MCP_MESSAGE_SIGNOFF_PREFIX.'
+  )
+  .option(
+    '--message-signoff-suffix <text>',
+    'Signoff appended to outgoing messages (default: none). Equivalent env var: MS365_MCP_MESSAGE_SIGNOFF_SUFFIX.'
+  )
+  .option('--no-message-signoff', 'Disable both message signoffs, overriding the env vars.')
+  .option(
+    '--http [address]',
+    'Use Streamable HTTP transport instead of stdio. Format: [host:]port (e.g., "localhost:3000", ":3000", "3000"). Default: all interfaces on port 3000'
+  )
+  .option(
+    '--enable-auth-tools',
+    'Enable login/logout tools when using HTTP mode (disabled by default in HTTP mode)'
+  )
+  .option(
+    '--enable-attachment-urls',
+    'HTTP mode only. Let get-download-url mint a short-TTL, single-use URL served by this server for Graph byte resources that expose no pre-authenticated URL of their own (mail and event attachments, meeting recordings, other $value endpoints). Also adds get-download-url to any --preset that lacks it (except teams-write). Requires MS365_MCP_ATTACHMENT_URL_BASE; MS365_MCP_ATTACHMENT_URL_KEY (or _KEY_FILE) is optional and adds an HMAC signature for fetchers that verify one'
+  )
+  .option(
+    '--attachment-port <port>',
+    'HTTP mode only. Serve the attachment download route on its own listener on this port instead of on the MCP app, so a caller that can fetch attachments cannot also reach /mcp. Requires --enable-attachment-urls, and MS365_MCP_ATTACHMENT_URL_BASE must name this port. A separate port only isolates the two surfaces if they also bind separate interfaces — see --attachment-host. Equivalent env var: MS365_MCP_ATTACHMENT_PORT.'
+  )
+  .option(
+    '--attachment-host <host>',
+    'Interface the --attachment-port listener binds (IPv4, IPv6 or hostname). Defaults to whatever --http bound, which with a wildcard --http means both ports answer on every interface — so a peer allowed onto the network to fetch attachments can also reach /mcp. Bind this to the address the fetcher uses and --http to a different one to make that unreachable rather than merely un-advertised. Requires --attachment-port. Equivalent env var: MS365_MCP_ATTACHMENT_HOST.'
+  )
+  .option(
+    '--enabled-tools <pattern>',
+    'Filter tools using regex pattern (e.g., "excel|contact" to enable Excel and Contact tools)'
+  )
+  .option(
+    '--enabled-tools-file <path>',
+    'Filter tools using a file with one regex per line (same semantics as --enabled-tools; blank lines and whole-line # comments ignored). Overrides --enabled-tools; overridden by --preset. Equivalent env var: ENABLED_TOOLS_FILE.'
+  )
+  .option(
+    '--allowed-scopes <scopes>',
+    'Limit exposed tools to Graph scopes covered by this whitespace-separated allowlist'
+  )
+  .option(
+    '--user-fields <fields>',
+    'Allow only these comma-separated Microsoft Graph fields in user profile responses (/users and /users/{id})'
+  )
+  .option(
+    '--extra-scopes <scopes>',
+    'Append additional Graph scopes (whitespace-separated) to the token request, beyond those derived from enabled tools. Use with your own app registration (MS365_MCP_CLIENT_ID/SECRET) to request scopes the default app does not declare, then call the endpoints via graph-batch.'
+  )
+  .option(
+    '--preset <names>',
+    'Use preset tool categories (comma-separated). Available: mail, calendar, files, personal, work, excel, contacts, tasks, onenote, search, users, outlook, onedrive, teams, teams-write, all'
+  )
+  .option('--list-presets', 'List all available presets and exit')
+  .option('--list-permissions', 'List all required Graph API permissions and exit')
+  .option(
+    '--org-mode',
+    'Enable organization/work mode from start (includes Teams, SharePoint, etc.)'
+  )
+  .option('--work-mode', 'Alias for --org-mode')
+  .option(
+    '--app-mode',
+    'Use application permissions with no signed-in user. stdio only. Needs one credential: MS365_MCP_CLIENT_SECRET, MS365_MCP_CLIENT_CERTIFICATE_PATH or MS365_MCP_FEDERATED_TOKEN_FILE (with your own app registration and MS365_MCP_TENANT_ID), or MS365_MCP_MANAGED_IDENTITY on an Azure host. Only tools that work with application permissions are offered.'
+  )
+  .option('--force-work-scopes', 'Backwards compatibility alias for --org-mode (deprecated)')
+  .option('--toon', '(experimental) Enable TOON output format for 30-60% token reduction')
+  .option(
+    '--no-app-views',
+    'Do not link interactive views (MCP Apps) to the Outlook mail tools. Tool results are identical either way; views only add tool metadata and ui:// resources. Equivalent env var: MS365_MCP_DISABLE_APP_VIEWS=true.'
+  )
+  .option(
+    '--eager-tools <names>',
+    'With --discovery, also expose these comma-separated exact Graph or utility tool names directly. All enabled tools remain discoverable. Env: MS365_MCP_EAGER_TOOLS.'
+  )
+  .option('--discovery', 'Enable runtime tool discovery and loading (experimental feature)')
+  .option(
+    '--cloud <type>',
+    'Microsoft cloud environment: global (default), china (21Vianet) or gcc-high (US Government GCC High)'
+  )
+  .option(
+    '--enable-dynamic-registration',
+    'Enable OAuth Dynamic Client Registration endpoint (kept for backwards compatibility, now enabled by default in HTTP mode)'
+  )
+  .option(
+    '--no-dynamic-registration',
+    'Disable OAuth Dynamic Client Registration endpoint in HTTP mode. Equivalent env var: MS365_MCP_DISABLE_DCR=true.'
+  )
+  .option(
+    '--auth-browser',
+    'Use browser-based interactive OAuth flow instead of device code for stdio mode. Opens system browser with localhost callback for seamless sign-in.'
+  )
+  .option(
+    '--public-url <url>',
+    'Public base URL (e.g. https://mcp.example.com) used in browser-facing OAuth redirects when running behind a reverse proxy. Server-to-server endpoints (token, register) stay on the request host.'
+  )
+  .option(
+    '--obo',
+    'Enable On-Behalf-Of token exchange in HTTP mode. Exchanges the incoming bearer token for a Graph API token using the OBO flow. Requires MS365_MCP_CLIENT_SECRET.'
+  )
+  .option(
+    '--trust-proxy-auth',
+    'In HTTP mode, skip the built-in Bearer-token check on /mcp and ignore any forwarded Authorization header. All callers share the locally cached MSAL identity (same path stdio mode uses). Single-user use only: refused unless --http binds a loopback host (localhost, 127.0.0.1 or [::1]), and then only for a proxy on the same machine that has already authenticated the caller.'
+  )
+  .option(
+    '--http-local-file-tools',
+    "In HTTP mode, also register the local file tools: download-bytes-to-file, which writes files on the server as the server's user, and upload-attachment-from-file, which reads files from the MS365_MCP_UPLOAD_DIRS directories when that is set. Anyone who can reach the port can use them, so enable only on a single-user machine. Refused unless --http binds a loopback host with no --public-url and no --trust-proxy-auth."
+  )
+  .option(
+    '--blob-output',
+    'File download tools (get-mail-message-mime, get-shared-mailbox-message-mime, get-mail-attachment-content, get-shared-mailbox-attachment-content) answer an MCP EmbeddedResource with the file instead of base64 JSON in a text block. Off by default.'
+  )
+  .option(
+    '--allow-unauthenticated-discovery',
+    'In HTTP mode, allow MCP discovery requests (initialize, tools/list, prompts/list, resources/list, ping) without a bearer token, so a gateway can enumerate the tool catalog before any user has authenticated. Non-discovery requests (e.g. tools/call) still require a token. Off by default.'
+  )
+  .addOption(
+    // DEPRECATED: kept only so existing deployments that set --base-url or
+    // MS365_MCP_BASE_URL do not crash at startup. Use --public-url /
+    // MS365_MCP_PUBLIC_URL instead. Hidden from --help; undocumented.
+    new Option('--base-url <url>', 'deprecated: use --public-url').hideHelp()
+  );
+
+export interface CommandOptions {
+  v?: boolean;
+  login?: boolean;
+  logout?: boolean;
+  verifyLogin?: boolean;
+  listAccounts?: boolean;
+  selectAccount?: string;
+  removeAccount?: string;
+  expectedUsername?: string;
+  expectedHomeAccountId?: string;
+  readOnly?: boolean;
+  messageSignoff?: boolean;
+  messageSignoffSuffix?: string;
+  messageSignoffPrefix?: string;
+  http?: string | boolean;
+  enableAuthTools?: boolean;
+  enableAttachmentUrls?: boolean;
+  /**
+   * Raw, unvalidated port for the split attachment listener. A string when it
+   * came from the command line or the environment; `server.ts` is what turns it
+   * into a number and refuses the values that are not one.
+   */
+  attachmentPort?: string | number;
+  /**
+   * Raw, unvalidated bind host for the split attachment listener. Unset means
+   * "inherit whatever --http bound", which is the pre-existing behaviour and
+   * stays the default. Validated in `server.ts` alongside the port, so the two
+   * halves of one decision are refused in one place.
+   */
+  attachmentHost?: string;
+  enabledTools?: string;
+  enabledToolsFile?: string;
+  allowedScopes?: string;
+  userFields?: string;
+  extraScopes?: string;
+  preset?: string;
+  listPresets?: boolean;
+  listPermissions?: boolean;
+  orgMode?: boolean;
+  appMode?: boolean;
+  workMode?: boolean;
+  forceWorkScopes?: boolean;
+  toon?: boolean;
+  /** false when --no-app-views was given; undefined or true leaves views on. */
+  appViews?: boolean;
+  discovery?: boolean;
+  eagerTools?: string[];
+  cloud?: string;
+  enableDynamicRegistration?: boolean;
+  dynamicRegistration?: boolean;
+  authBrowser?: boolean;
+  obo?: boolean;
+  trustProxyAuth?: boolean;
+  httpLocalFileTools?: boolean;
+  blobOutput?: boolean;
+  allowUnauthenticatedDiscovery?: boolean;
+  publicUrl?: string;
+  /** @deprecated use publicUrl */
+  baseUrl?: string;
+
+  [key: string]: unknown;
+}
+
+export function parseArgs(): CommandOptions {
+  program.parse();
+  const options = program.opts();
+
+  // Fold the signoff flags into the env vars that lib/message-signoff.ts reads at send time
+  if (typeof options.messageSignoffSuffix === 'string') {
+    process.env.MS365_MCP_MESSAGE_SIGNOFF_SUFFIX = options.messageSignoffSuffix;
+  }
+  if (typeof options.messageSignoffPrefix === 'string') {
+    process.env.MS365_MCP_MESSAGE_SIGNOFF_PREFIX = options.messageSignoffPrefix;
+  }
+  if (options.messageSignoff === false) {
+    process.env.MS365_MCP_MESSAGE_SIGNOFF_SUFFIX = '';
+    process.env.MS365_MCP_MESSAGE_SIGNOFF_PREFIX = '';
+  }
+  // Same for blob output, which graph-client.ts reads per download
+  if (options.blobOutput) {
+    process.env.MS365_MCP_BLOB_OUTPUT = 'true';
+  }
+  // Markup in a marker is allowed (e.g. a coloured <span>), but refuse to start
+  // with one that renders as empty text - html sends would look unsigned.
+  assertSignoffMarkersVisible();
+  assertUploadDirsAbsolute();
+
+  if (options.listPresets) {
+    const presets = listPresets();
+    console.log(JSON.stringify({ presets }, null, 2));
+    process.exit(0);
+  }
+
+  // Tool filter layering (later wins): --enabled-tools → --enabled-tools-file →
+  // --preset → ENABLED_TOOLS → ENABLED_TOOLS_FILE.
+  if (typeof options.enabledToolsFile === 'string') {
+    try {
+      options.enabledTools = readEnabledToolsFromFile(options.enabledToolsFile);
+    } catch (error) {
+      console.error(`Error: ${(error as Error).message}`);
+      process.exit(1);
+    }
+  }
+  delete options.enabledToolsFile;
+
+  const eagerValue = options.eagerTools ?? (process.env.MS365_MCP_EAGER_TOOLS?.trim() || undefined);
+  if (eagerValue !== undefined) {
+    if (!options.discovery) throw new Error('--eager-tools requires --discovery');
+    const names = String(eagerValue)
+      .split(',')
+      .map((name) => name.trim());
+    if (names.some((name) => name === ''))
+      throw new Error('--eager-tools requires non-empty exact tool names');
+    options.eagerTools = [...new Set(names)];
+  }
+
+  if (process.env.MS365_MCP_APP_MODE === 'true' || process.env.MS365_MCP_APP_MODE === '1') {
+    options.appMode = true;
+  }
+
+  // App mode is tenant-only, so the work-account guidance and presets apply
+  if (options.appMode) {
+    options.orgMode = true;
+  }
+
+  if (options.preset) {
+    const presetNames = options.preset.split(',').map((p: string) => p.trim());
+    try {
+      // The flag only acts in HTTP mode (server.ts ignores it under stdio).
+      options.enabledTools = getCombinedPresetPattern(presetNames, {
+        attachmentUrls: Boolean(options.http && options.enableAttachmentUrls),
+      });
+
+      const requiresOrgMode = presetNames.some((preset: string) => presetRequiresOrgMode(preset));
+      if (requiresOrgMode && !options.orgMode) {
+        console.warn(
+          `Warning: Preset(s) [${presetNames.filter((p: string) => presetRequiresOrgMode(p)).join(', ')}] require --org-mode to function properly`
+        );
+      }
+    } catch (error) {
+      console.error(`Error: ${(error as Error).message}`);
+      process.exit(1);
+    }
+  }
+
+  if (process.env.READ_ONLY === 'true' || process.env.READ_ONLY === '1') {
+    options.readOnly = true;
+  }
+
+  if (process.env.ENABLED_TOOLS) {
+    options.enabledTools = process.env.ENABLED_TOOLS;
+  }
+
+  if (process.env.ENABLED_TOOLS_FILE) {
+    try {
+      options.enabledTools = readEnabledToolsFromFile(process.env.ENABLED_TOOLS_FILE);
+    } catch (error) {
+      console.error(`Error: ${(error as Error).message}`);
+      process.exit(1);
+    }
+  }
+
+  if (options.allowedScopes === undefined && process.env.MS365_MCP_ALLOWED_SCOPES !== undefined) {
+    options.allowedScopes = process.env.MS365_MCP_ALLOWED_SCOPES;
+  }
+
+  if (options.allowedScopes !== undefined && options.allowedScopes.trim() === '') {
+    console.error(
+      'Error: --allowed-scopes / MS365_MCP_ALLOWED_SCOPES was provided but is empty. ' +
+        'Provide one or more whitespace-separated scopes, or omit it to use tool-derived scopes.'
+    );
+    process.exit(1);
+  }
+
+  if (options.userFields === undefined && process.env.MS365_MCP_USER_FIELDS !== undefined) {
+    options.userFields = process.env.MS365_MCP_USER_FIELDS;
+  }
+
+  if (
+    options.userFields !== undefined &&
+    String(options.userFields)
+      .split(',')
+      .every((field: string) => field.trim() === '')
+  ) {
+    console.error(
+      'Error: --user-fields / MS365_MCP_USER_FIELDS was provided but names no fields. ' +
+        'Provide one or more comma-separated Graph fields, or omit it to disable the user profile field boundary.'
+    );
+    process.exit(1);
+  }
+
+  if (options.extraScopes === undefined && process.env.MS365_MCP_EXTRA_SCOPES !== undefined) {
+    options.extraScopes = process.env.MS365_MCP_EXTRA_SCOPES;
+  }
+
+  if (options.extraScopes !== undefined && options.extraScopes.trim() === '') {
+    console.error(
+      'Error: --extra-scopes / MS365_MCP_EXTRA_SCOPES was provided but is empty. ' +
+        'Provide one or more whitespace-separated scopes, or omit it.'
+    );
+    process.exit(1);
+  }
+
+  // CLI wins over env, same as every other option here. Left as the raw string:
+  // the value is only meaningful together with --enable-attachment-urls and
+  // --http, and both of those are decided in server.ts, so that is where it is
+  // parsed and rejected -- one message, one place, whichever way it arrived.
+  if (options.attachmentPort === undefined && process.env.MS365_MCP_ATTACHMENT_PORT !== undefined) {
+    options.attachmentPort = process.env.MS365_MCP_ATTACHMENT_PORT;
+  }
+
+  // Same idiom, same reasoning, and deliberately a variable of its own rather
+  // than a host accepted inside MS365_MCP_ATTACHMENT_PORT: a variable named
+  // _PORT holding `10.89.0.5:3001` misreads at a glance, and the two values
+  // default differently -- an absent port means "no second listener", an absent
+  // host means "inherit the MCP one".
+  if (options.attachmentHost === undefined && process.env.MS365_MCP_ATTACHMENT_HOST !== undefined) {
+    options.attachmentHost = process.env.MS365_MCP_ATTACHMENT_HOST;
+  }
+
+  if (
+    options.expectedUsername === undefined &&
+    process.env.MS365_MCP_EXPECTED_USERNAME !== undefined
+  ) {
+    options.expectedUsername = process.env.MS365_MCP_EXPECTED_USERNAME;
+  }
+
+  if (
+    options.expectedHomeAccountId === undefined &&
+    process.env.MS365_MCP_EXPECTED_HOME_ACCOUNT_ID !== undefined
+  ) {
+    options.expectedHomeAccountId = process.env.MS365_MCP_EXPECTED_HOME_ACCOUNT_ID;
+  }
+
+  if (options.expectedUsername !== undefined) {
+    const expectedUsername = String(options.expectedUsername).trim();
+    if (expectedUsername === '') {
+      console.error(
+        'Error: --expected-username / MS365_MCP_EXPECTED_USERNAME was provided but is empty. ' +
+          'Provide a Microsoft account username, or omit it to allow any cached account.'
+      );
+      process.exit(1);
+    }
+    options.expectedUsername = expectedUsername;
+  }
+
+  if (options.expectedHomeAccountId !== undefined) {
+    const expectedHomeAccountId = String(options.expectedHomeAccountId).trim();
+    if (expectedHomeAccountId === '') {
+      console.error(
+        'Error: --expected-home-account-id / MS365_MCP_EXPECTED_HOME_ACCOUNT_ID was provided but is empty. ' +
+          'Provide an MSAL homeAccountId, or omit it to allow any cached account.'
+      );
+      process.exit(1);
+    }
+    options.expectedHomeAccountId = expectedHomeAccountId;
+  }
+
+  // Validate tool filter regex early — fail at startup instead of silently
+  // disabling the filter at runtime (which would expose all tools)
+  if (options.enabledTools) {
+    try {
+      new RegExp(options.enabledTools, 'i');
+    } catch {
+      console.error(
+        `Error: invalid --enabled-tools regex pattern: "${options.enabledTools}". ` +
+          `Without a valid filter, all tools would be exposed.`
+      );
+      process.exit(1);
+    }
+  }
+
+  if (process.env.MS365_MCP_ORG_MODE === 'true' || process.env.MS365_MCP_ORG_MODE === '1') {
+    options.orgMode = true;
+  }
+
+  if (
+    process.env.MS365_MCP_FORCE_WORK_SCOPES === 'true' ||
+    process.env.MS365_MCP_FORCE_WORK_SCOPES === '1'
+  ) {
+    options.forceWorkScopes = true;
+  }
+
+  if (options.workMode || options.forceWorkScopes) {
+    options.orgMode = true;
+  }
+
+  if (process.env.MS365_MCP_OUTPUT_FORMAT === 'toon') {
+    options.toon = true;
+  }
+
+  // Dynamic registration defaults to true in HTTP mode.
+  // CLI flags `--enable-dynamic-registration` / `--no-dynamic-registration` take
+  // precedence; otherwise `MS365_MCP_DISABLE_DCR=true|1` opts the deployment out
+  // (allows env-var-only configuration in container platforms without modifying
+  // process args).
+  if (options.http) {
+    const dcrDisabledByEnv =
+      process.env.MS365_MCP_DISABLE_DCR === 'true' || process.env.MS365_MCP_DISABLE_DCR === '1';
+    if (options.dynamicRegistration === false || dcrDisabledByEnv) {
+      options.enableDynamicRegistration = false;
+    } else {
+      options.enableDynamicRegistration = true;
+    }
+  }
+
+  if (process.env.MS365_MCP_OBO === 'true' || process.env.MS365_MCP_OBO === '1') {
+    options.obo = true;
+  }
+
+  if (
+    process.env.MS365_MCP_TRUST_PROXY_AUTH === 'true' ||
+    process.env.MS365_MCP_TRUST_PROXY_AUTH === '1'
+  ) {
+    options.trustProxyAuth = true;
+  }
+
+  if (
+    process.env.MS365_MCP_HTTP_LOCAL_FILE_TOOLS === 'true' ||
+    process.env.MS365_MCP_HTTP_LOCAL_FILE_TOOLS === '1'
+  ) {
+    options.httpLocalFileTools = true;
+  }
+
+  if (
+    process.env.MS365_MCP_ALLOW_UNAUTHENTICATED_DISCOVERY === 'true' ||
+    process.env.MS365_MCP_ALLOW_UNAUTHENTICATED_DISCOVERY === '1'
+  ) {
+    options.allowUnauthenticatedDiscovery = true;
+  }
+
+  // Handle cloud type - CLI option takes precedence over environment variable
+  if (options.cloud) {
+    process.env.MS365_MCP_CLOUD_TYPE = options.cloud;
+  }
+
+  return options;
+}

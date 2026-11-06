@@ -1,0 +1,127 @@
+# Config fragment for the MCP views work (generated 2026-11-06)
+endpoints:
+  agents:
+    toolApproval:
+      enabled: true
+      agentModes: true
+      grantLookupTimeoutMs: 3000
+      mode: default
+      allow:
+        - '*_mcp_pagehand'
+        - list-*_mcp_m365
+        - get-*_mcp_m365
+        - read-mail-text_mcp_m365
+        - create-*-draft*_mcp_m365
+        - create-draft-email_mcp_m365
+        - update-mail-message_mcp_m365
+        - list-calendar-events_mcp_m365
+        - get-calendar-view_mcp_m365
+        - get-calendar-event_mcp_m365
+        - list-chats_mcp_m365
+        - get-chat_mcp_m365
+        - compose-chat-message_mcp_m365
+        - compose-calendar-event_mcp_m365
+        - list-folder-files_mcp_m365
+        - get-drive-item_mcp_m365
+        - search-onedrive-files_mcp_m365
+        - list-outlook-contacts_mcp_m365
+        - list-contact-folder-contacts_mcp_m365
+        - get-outlook-contact_mcp_m365
+        - list-todo-task-lists_mcp_m365
+        - list-todo-tasks_mcp_m365
+        - list-chat-messages_mcp_m365
+        - get-chat-message_mcp_m365
+        - list-chat-message-replies_mcp_m365
+        - list-joined-teams_mcp_m365
+        - list-team-channels_mcp_m365
+        - list-channel-messages_mcp_m365
+        - get-channel-message_mcp_m365
+        - list-channel-message-replies_mcp_m365
+        - core_list_project_teams_mcp_ado
+        - core_list_projects_mcp_ado
+        - core_get_identity_ids_mcp_ado
+        - work_mcp_ado
+        - pipelines_build_mcp_ado
+        - pipelines_build_log_mcp_ado
+        - pipelines_definition_mcp_ado
+        - pipelines_artifact_mcp_ado
+        - repo_repository_mcp_ado
+        - repo_pull_request_mcp_ado
+        - repo_pull_request_org_mcp_ado
+        - repo_pull_request_thread_mcp_ado
+        - repo_branch_mcp_ado
+        - repo_file_mcp_ado
+        - repo_search_commits_mcp_ado
+        - wit_work_item_mcp_ado
+        - wit_query_mcp_ado
+        - wit_backlog_mcp_ado
+        - wit_work_item_form_mcp_ado
+        - wit_board_mcp_ado
+        - testplan_test_case_form_mcp_ado
+        - repo_pull_request_form_mcp_ado
+        - pipelines_run_form_mcp_ado
+        - pipelines_run_mcp_ado
+        - core_get_current_user_mcp_ado
+        - work_sprint_mcp_ado
+        - wit_work_item_attachment_mcp_ado
+        - testplan_mcp_ado
+        - testplan_show_test_results_from_build_id_mcp_ado
+      ask:
+        - '*_write_mcp_ado'
+        - repo_create_branch_mcp_ado
+        - wit_work_item_attachment_upload_mcp_ado
+        - wit_work_item_attachment_link_mcp_ado
+        - send-mail_mcp_m365
+        - send-draft-message_mcp_m365
+        - move-mail-message_mcp_m365
+        - delete-mail-message_mcp_m365
+        - create-calendar-event_mcp_m365
+        - update-calendar-event_mcp_m365
+        - delete-calendar-event_mcp_m365
+        - accept-calendar-event_mcp_m365
+        - tentatively-accept-calendar-event_mcp_m365
+        - decline-calendar-event_mcp_m365
+        - send-chat-message_mcp_m365
+        - create-onedrive-folder_mcp_m365
+        - move-rename-onedrive-item_mcp_m365
+        - delete-onedrive-file_mcp_m365
+        - update-todo-task_mcp_m365
+        - create-todo-task_mcp_m365
+        - reply-to-chat-message_mcp_m365
+        - send-channel-message_mcp_m365
+        - reply-to-channel-message_mcp_m365
+        - run_script_mcp_pagehand
+        - attach_file_mcp_pagehand
+        - '*_mcp_deepwiki'
+        - '*_mcp_context7'
+  all:
+    maxToolResultChars: 60000
+mcpSettings:
+  apps: true
+  appsHonorToolApproval: true
+  allowedAddresses:
+    - localhost:8230
+    - localhost:3000
+    - localhost:3001
+mcpAppSandbox:
+  url: http://localhost:3080/api/mcp/sandbox
+  maxPersistedAppBytes: 4194304
+mcpServers:
+  m365:
+    title: Microsoft 365
+    description: >-
+      Outlook mail, calendar and Teams for the signed-in user through Microsoft Graph. Reads run directly; sending,
+      moving and deleting ask for approval.
+    type: streamable-http
+    url: http://localhost:3000/mcp
+    requiresOAuth: true
+    timeout: 120000
+  ado:
+    title: Azure DevOps
+    description: >-
+      Boards, work items, sprints, repos, pipelines and test plans in the gaavi organization (project Dev). Reads run
+      directly; creating and updating ask for approval.
+    type: streamable-http
+    url: http://localhost:3001/mcp
+    requiresOAuth: true
+    timeout: 120000

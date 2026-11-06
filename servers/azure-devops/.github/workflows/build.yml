@@ -1,0 +1,124 @@
+name: Build MCP Server
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - "main"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build the project
+    runs-on: windows-latest
+
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Remove .npmrc - uses standard registry for internal build check - non-release version
+        run: |
+          if (Test-Path .npmrc) {
+            Remove-Item .npmrc
+          }
+        shell: pwsh
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Clean install dependencies
+        run: npm ci
+
+      - name: Build the project
+        run: npm run build
+
+      - name: Validate tool names and parameters
+        run: npm run validate-tools
+
+      - name: Run tests
+        run: npm test
+
+      - name: Display coverage summary
+        run: |
+          Write-Host "=== Code Coverage Summary ==="
+          if (Test-Path "coverage/lcov-report/index.html") {
+            Write-Host "Coverage report generated successfully"
+            if (Test-Path "coverage/coverage-summary.json") {
+              $coverage = Get-Content "coverage/coverage-summary.json" | ConvertFrom-Json
+              $total = $coverage.total
+              Write-Host "Lines: $($total.lines.pct)%"
+              Write-Host "Functions: $($total.functions.pct)%"
+              Write-Host "Branches: $($total.branches.pct)%"
+              Write-Host "Statements: $($total.statements.pct)%"
+            }
+          }
+        shell: pwsh
+
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          file: ./coverage/lcov.info
+          flags: unittests
+          name: azure-devops-mcp-coverage
+          fail_ci_if_error: false
+
+      - name: Validate server startup via npx
+        shell: pwsh
+        run: |
+          $result = & npx mcp-server-azuredevops 2>&1 | Out-String
+          if ($result -notmatch "Usage: mcp-server-azuredevops <organization>") {
+            Write-Host "Expected usage message not found in output:"
+            Write-Host $result
+            exit 1
+          }
+          Write-Host "Validation passed."
+          exit 0
+
+  static-code-analysis:
+    name: Static code analysis
+    runs-on: windows-latest
+
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Clean install dependencies
+        run: npm ci
+
+      - name: Static code analysis
+        run: npm run eslint
+
+      - name: Check code formatting
+        run: npm run format-check
+
+      - name: Verify package version is synced
+        run: |
+          git diff --exit-code ./src/version.ts
+          if (!$?) {
+            Write-Host "Version mismatch detected. Please ensure that the version information in version.ts is up to date with package.json."
+            exit 1
+          }
+          git diff --exit-code ./package-lock.json
+          if (!$?) {
+            Write-Host "Please run 'npm install' to update package-lock.json and add changes to the commit."
+            exit 1
+          }
